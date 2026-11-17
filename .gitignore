@@ -1,0 +1,23 @@
+# V compiles a `v run` script into a binary beside it, and a test file is
+# compiled into a binary next to the source. Neither is content.
+/build
+/target
+*.o
+*.a
+
+# Agent working state. Plans, probes and notes for one run live here and are
+# never committed.
+.omh/
+
+# Coding tools drop a directory into a working tree. None of it is project
+# content, and a tool that is not listed gets a line rather than a commit.
+.claude/
+.codex/
+.opencode/
+.omo/
+.cursor/
+.gemini/
+.continue/
+.aider*
+.kilo/
+.zed/
