@@ -39,7 +39,8 @@ before the move, with the programs still running the way their tests expect.
 ## Using it
 
 ```v
-import vlk
+import vanadiume.vlk
+import vanadiume.vlk.unit
 
 merged := vlk.link(units, vlk.Options{
 	entry: 'main'
@@ -53,6 +54,11 @@ merged := vlk.link(units, vlk.Options{
 	libraries: ['libc.so.6']
 })!
 ```
+
+The import path is the name the package is published under; the identifiers a
+program writes are the module names, `vlk` and `unit`. A checkout linked into
+`~/.vmodules/vlk` rather than installed through the registry is imported as
+plain `vlk` and `vlk.unit`, which is what a program in this tree uses.
 
 `link` answers with the merged program and not with a file. Wrapping the program
 in the container the system runs is `output`'s work, and the caller decides
@@ -74,8 +80,12 @@ that consumes this library.
 ## Install
 
 ```sh
-v install vanadiume/vlk
+v install vanadiume.vlk
 ```
+
+The registry name carries the author's name and is what `v install` takes; the
+repository is https://github.com/vanadiume/vlk. `v install vanadiume/vlk` is not
+the same name and the registry answers that it does not exist.
 
 To work on the library against a consumer in the same checkout, install it as a
 link rather than a copy:

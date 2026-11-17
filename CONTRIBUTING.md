@@ -22,9 +22,10 @@ v test .
 v run tools/gate.vsh
 ```
 
-`v install vanadiume/vlk` puts a copy in `~/.vmodules`. While you are working on
-the library, point `~/.vmodules/vlk` at your checkout instead, so a program that
-imports `vlk` sees the code you are editing:
+`v install vanadiume.vlk` puts a copy in `~/.vmodules` under the author's name,
+where it is imported as `vanadiume.vlk` and `vanadiume.vlk.unit`. While you are
+working on the library, point `~/.vmodules/vlk` at your checkout instead, which
+is the flat spelling a program in this tree uses:
 
 ```sh
 ln -sfn "$PWD" ~/.vmodules/vlk
