@@ -10,3 +10,4 @@ number moves when a released tag does.
 - The repository: the manifest `vpm` reads, the licence, and the documents that
   say what the library is, how a change is checked, and what the tree is working
   toward.
+- `unit/`: the model of one input to a link, moved from vcc's `image/` module.
