@@ -13,3 +13,5 @@ number moves when a released tag does.
 - `unit/`: the model of one input to a link, moved from vcc's `image/` module.
 - `vlk.Target`, `vlk.Options` and `vlk.link`, the entry a caller is written
   against. `link` refuses until the implementation moves.
+- `tools/gate.vsh`: formatting, the pure-V rule, the suite, and the relative
+  links in the documents, in one command.
