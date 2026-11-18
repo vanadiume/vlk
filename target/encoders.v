@@ -79,3 +79,61 @@ pub fn (t &Target) check_encoders() ! {
 		return error('the target ${t.name} carries no instruction encoder for ${missing.join(', ')}')
 	}
 }
+
+// The target reads its instructions through these, so a container asks the
+// target and not the table it holds. A caller that replaces one encoder replaces
+// it in one place, and the call sites keep saying what the instruction is for.
+
+pub fn (t &Target) call_near(disp i32) []u8 {
+	return t.encoders.call_near(disp)
+}
+
+pub fn (t &Target) call_slot(disp i32) []u8 {
+	return t.encoders.call_slot(disp)
+}
+
+pub fn (t &Target) jump(disp i32) []u8 {
+	return t.encoders.jump(disp)
+}
+
+pub fn (t &Target) jump_slot(disp i32) []u8 {
+	return t.encoders.jump_slot(disp)
+}
+
+pub fn (t &Target) jump_if_zero(disp i32) []u8 {
+	return t.encoders.jump_if_zero(disp)
+}
+
+pub fn (t &Target) jump_if_not_zero(disp i32) []u8 {
+	return t.encoders.jump_if_not_zero(disp)
+}
+
+pub fn (t &Target) address_of(reg Register, disp i32) []u8 {
+	return t.encoders.address_of(reg, disp)
+}
+
+pub fn (t &Target) load_slot_value(reg Register, disp i32) []u8 {
+	return t.encoders.load_slot_value(reg, disp)
+}
+
+pub fn (t &Target) load_double_constant(reg Register, disp i32) ![]u8 {
+	return t.encoders.load_double_constant(reg, disp)
+}
+
+pub fn (t &Target) load_float_constant(reg Register, disp i32) ![]u8 {
+	return t.encoders.load_float_constant(reg, disp)
+}
+
+// The three relocation numbers a relocatable object carries, read off the target
+// the same way its instructions are.
+pub fn (t &Target) call_relocation() u32 {
+	return t.relocation_call
+}
+
+pub fn (t &Target) address_relocation() u32 {
+	return t.relocation_pc_relative
+}
+
+pub fn (t &Target) got_relocation() u32 {
+	return t.relocation_got_pc_relative
+}

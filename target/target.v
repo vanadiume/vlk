@@ -40,6 +40,15 @@ pub:
 	// linker's, so a second machine fills its own.
 	registers       []Register
 	float_registers []Register
+	// relocation_call, relocation_pc_relative and relocation_got_pc_relative are
+	// the numbers this machine gives a reference it leaves to a link: a call to a
+	// name the object does not define, a distance the code computes, and a
+	// reference to an object through the global offset table. The writer of a
+	// relocatable object is the one that needs them; an image written from units
+	// that settled their own references carries none.
+	relocation_call            u32
+	relocation_pc_relative     u32
+	relocation_got_pc_relative u32
 	// encoders are the instructions a container writes: the stub it makes for a
 	// library call, and the replacement it puts over a reference the code left as
 	// a field. `check_encoders` says which ones a target is missing.
