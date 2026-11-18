@@ -213,12 +213,11 @@ fn archive_of(name string, member []u8, symbols []string) []u8 {
 	return out
 }
 
-fn test_an_archive_member_answers_an_import() {
-	machine := host()
-	// The program calls `helper` and defines nothing by that name itself, so the
-	// only thing that can answer it is a member of the archive. The call is a
-	// fixup, which is what puts the name in the object file as an undefined
-	// symbol: a name nothing references is a name no linker is asked about.
+// calling_helper is a program whose entry calls `helper` and then stops with
+// zero. The call is a fixup, which is what puts the name in the object file as
+// an undefined symbol: a name nothing references is a name no linker is asked
+// about.
+fn calling_helper() unit.Program {
 	mut caller := unit.Program{}
 	caller.text = [u8(0xe8), u8(0), u8(0), u8(0), u8(0), u8(0xbf), u8(0), u8(0), u8(0), u8(0),
 		u8(0xb8), u8(60), u8(0), u8(0), u8(0), u8(0x0f), u8(0x05)]
@@ -231,17 +230,35 @@ fn test_an_archive_member_answers_an_import() {
 		kind:   .call_import
 		name:   'helper'
 	}
-	caller_bytes := elf.object(caller, machine) or { panic('the object was not written: ${err.msg()}') }
-	caller_path := scratch('caller.o')
-	os.write_file_array(caller_path, caller_bytes) or { panic(err) }
-	// The member defines it, and stops with a status of its own so the test can
-	// tell the member ran rather than the caller's own exit.
+	return caller
+}
+
+// exiting_helper defines the name calling_helper imports and stops with a status
+// of its own, so the test can tell the member ran rather than the caller's own
+// exit.
+fn exiting_helper() unit.Program {
 	mut helper := unit.Program{}
 	helper.text = [u8(0xbf), u8(9), u8(0), u8(0), u8(0), u8(0xb8), u8(60), u8(0), u8(0), u8(0),
 		u8(0x0f), u8(0x05)]
 	helper.defined['helper'] = true
 	helper.labels['helper'] = 0
-	helper_bytes := elf.object(helper, machine) or { panic('the object was not written: ${err.msg()}') }
+	return helper
+}
+
+fn test_an_archive_member_answers_an_import() {
+	machine := host()
+	// The program calls `helper` and defines nothing by that name itself, so the
+	// only thing that can answer it is a member of the archive.
+	caller_bytes := elf.object(calling_helper(), machine) or {
+		panic('the object was not written: ${err.msg()}')
+	}
+	caller_path := scratch('caller.o')
+	os.write_file_array(caller_path, caller_bytes) or { panic(err) }
+	// The member defines it, and stops with a status of its own so the test can
+	// tell the member ran rather than the caller's own exit.
+	helper_bytes := elf.object(exiting_helper(), machine) or {
+		panic('the object was not written: ${err.msg()}')
+	}
 	archive_path := scratch('libnine.a')
 	os.write_file_array(archive_path, archive_of('nine.o', helper_bytes, ['helper'])) or {
 		panic(err)
@@ -264,5 +281,56 @@ fn test_an_archive_member_answers_an_import() {
 	}) or { panic('the link failed: ${err.msg()}') }
 	assert report.units == 2
 	assert report.pulled == 1
+	assert run_image(out) == 9
+}
+
+// A `-l` name goes through the link's own search, and a name that resolves to a
+// static archive brings that archive's members into the link the way a path that
+// names it does. The archive is in a directory of its own and the link is never
+// handed its path, so nothing but the search can have read it.
+fn test_a_library_name_that_resolves_to_an_archive_pulls_its_members() {
+	machine := host()
+	// The file is named `libnine.a`, which is what the search looks for under
+	// `-lnine`.
+	dir := os.join_path(os.temp_dir(), 'vlk_link_found_${os.getpid()}')
+	os.mkdir_all(dir) or { panic(err) }
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	caller_path := scratch('found_caller.o')
+	os.write_file_array(caller_path, elf.object(calling_helper(), machine) or {
+		panic('the object was not written: ${err.msg()}')
+	}) or { panic(err) }
+	os.write_file_array(os.join_path(dir, 'libnine.a'), archive_of('nine.o',
+		elf.object(exiting_helper(), machine) or {
+			panic('the object was not written: ${err.msg()}')
+		}, ['helper'])) or { panic(err) }
+	// The same link without the name is still refused, which says the member the
+	// search pulled is what answers `helper` and not something already in the
+	// link.
+	mut refused := false
+	link_files([caller_path], Options{
+		entry:  'main'
+		target: machine
+		output: scratch('found_without')
+	}) or {
+		refused = true
+		assert err.msg().contains('undefined reference')
+		assert err.msg().contains('helper')
+	}
+	assert refused, 'a link that named no library pulled a member that defines helper'
+	out := scratch('found_nine')
+	report := link_files([caller_path], Options{
+		entry:        'main'
+		target:       machine
+		output:       out
+		library_dirs: [dir]
+		libraries:    ['nine']
+	}) or { panic('the link failed: ${err.msg()}') }
+	assert report.units == 2
+	assert report.pulled == 1
+	// The archive is named by the image nowhere: the loader maps no file for it,
+	// and the member ran out of the image itself.
+	assert report.libraries.len == 0
 	assert run_image(out) == 9
 }

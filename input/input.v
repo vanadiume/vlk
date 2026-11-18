@@ -37,7 +37,8 @@ pub mut:
 	// from it is the names it defines and the name the loader asks for.
 	shared []library.Library
 	// pulled is how many of the units came out of an archive rather than from a
-	// path of their own.
+	// path of their own, which is a path that names an archive and a `-l` name
+	// that resolved to one.
 	pulled int
 }
 
@@ -74,9 +75,22 @@ pub fn classify(bytes []u8, path string) !Kind {
 // defines yet, and swept again while a sweep pulled something, because a member
 // brings imports of its own and the next member may be what answers them. The
 // sweep is per archive and in the order the paths were given: a name an earlier
-// archive opens is answered by a later one and not the other way round, which is
-// what a command line's own `-l` names mean.
-pub fn read(paths []string, machine target.Target) !Read {
+// archive opens is answered by a later one and not the other way round.
+//
+// The `-l` names come after the paths, in the order they were written. A name
+// that resolves to a static archive is not a file the loader maps, so it is not
+// recorded and the image asks it for nothing: what the link takes from it is the
+// members that answer a name nothing defines yet, pulled by the same sweep and
+// against the same two maps as a path that names an archive. A name that
+// resolves to a shared object is left alone here, since `settled` records its
+// soname and asks it for the names the merge leaves to the loader.
+//
+// A command line interleaves paths and `-l` names, and this call takes them as
+// two lists, so the order the link reads is the paths and then the names. That
+// is the order in which a link that has already sorted its inputs by kind reads
+// them; a caller that needs the command line's own order passes the archives it
+// cares about as paths.
+pub fn read(paths []string, libraries []string, library_dirs []string, machine target.Target) !Read {
 	mut out := Read{}
 	mut provided := map[string]bool{}
 	mut needed := map[string]bool{}
@@ -100,6 +114,24 @@ pub fn read(paths []string, machine target.Target) !Read {
 				}
 				out.shared << found
 			}
+		}
+	}
+	// A `-l` name that resolved to a static archive is read the way a path that
+	// names one is. The search is the dynamic one's, which is the search the
+	// check in `settled` makes over the same names: a pull made by one search
+	// and reported by another would be a link that pulled a member and then
+	// said the name it answers is undefined.
+	if libraries.len > 0 {
+		dirs := library.search_dirs(library_dirs, machine.library_dirs)
+		for found in library.resolve_library_files(libraries, dirs, false)! {
+			if !found.archive {
+				continue
+			}
+			bytes := os.read_bytes(found.path) or { return error('${found.path}: ${err.msg()}') }
+			parts := archive.read(bytes) or { return error('${found.path}: ${err.msg()}') }
+			members := pull(parts, found.path, machine, mut needed, mut provided)!
+			out.pulled += members.len
+			out.units << members
 		}
 	}
 	return out

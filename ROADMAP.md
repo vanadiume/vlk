@@ -33,12 +33,11 @@ Left:
   move, checked across vcc's corpora, with the programs run.
 - Link time for vcc's V self-build measured against lld, with the numbers in the
   README.
-- A `-l` name that resolves to a static archive is read by nothing:
-  `library.resolve_libraries` leaves archives out because the loader does not map
-  one, and no member of it is pulled, so the names it defines come back as
-  undefined references. A path that names the archive works, through `input/`.
-  vcc's own driver does this sweep in its `main.v` today, and the high entry needs
-  it before a caller can drop that code.
+- A `-l` name that resolves to a GNU ld script still contributes only the library
+  the script names. `library.archive_libraries` answers the archives a script
+  names beside it, `libc_nonshared.a` in the C library's own script among them,
+  and no member of one is pulled: that list is read by nothing, so a name only
+  such an archive defines still comes back as an undefined reference.
 
 ## 0.2.0: a linker another tree can use
 

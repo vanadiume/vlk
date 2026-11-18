@@ -362,11 +362,16 @@ pub:
 // what comes out, and the image is written to `Options.output` when that names a
 // file.
 //
+// The `-l` names the caller passed are part of the same read: a name that
+// resolves to a static archive adds the members that answer a name nothing
+// defines yet, after the paths and in the order the names were written, because
+// two lists cannot carry the order one command line has.
+//
 // This is the entry for a caller that does not want to drive a linker: one call,
 // paths in, an executable out. A caller that has units already, or wants the
 // image bytes and no file, uses `link` or `merge` instead.
 pub fn link_files(paths []string, options Options) !Report {
-	read := input.read(paths, options.target)!
+	read := input.read(paths, options.libraries, options.library_dirs, options.target)!
 	mut opts := options
 	if read.shared.len > 0 {
 		mut shared := opts.shared_libraries.clone()
