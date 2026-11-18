@@ -5,25 +5,40 @@ when its paragraphs are true, not when its list is checked off.
 
 ## 0.0.x: the repository and the model
 
-- The documents, the manifest and the gate.
-- `unit/`: the model of one input, moved out of vcc's `image/` module.
-- `target/`: the machine and system facts a link needs, filled by the caller.
-- `vlk.link`: the entry a caller is written against, refusing until there is an
-  implementation behind it.
+Done. The documents, the manifest, the gate, `unit/` moved out of vcc's
+`image/` module, `target/` filled by the caller, and the entry a caller is
+written against.
 
 ## 0.1.0: the split
 
-vcc links through vlk and keeps no linker of its own.
+The library links. What is left is vcc linking through it.
 
-- `symbols/`, `place/`, `reloc/` and `output/` moved in from vcc's `linking/`.
+Done:
+
+- `symbols/`, `place/`, `reloc/` and `output/` moved in from vcc's `linking/`,
+  with the merge's tests.
 - `object/`: a relocatable object file read into a unit.
 - `archive/`: `ar` archives, read for the members that answer a name.
 - `elf/`: the container and the writer that turns a merged program into bytes.
+- `library/` and `input/`: what a `-l` name comes to, and the paths of a link
+  read into units.
+- `vlk.merge`, `vlk.link` and `vlk.link_files`: the three depths a caller
+  picks from.
+
+Left:
+
+- vcc builds `vlk.Options` and calls `vlk.link`, its `codegen/` imports `unit`,
+  and its `linking/` and `image/` directories are gone.
 - Images byte for byte identical to the ones vcc's own linker wrote before the
   move, checked across vcc's corpora, with the programs run.
 - Link time for vcc's V self-build measured against lld, with the numbers in the
   README.
-- vcc's `linking/` deleted, and its `AGENTS.md` pointing at this library.
+- A `-l` name that resolves to a static archive is read by nothing:
+  `library.resolve_libraries` leaves archives out because the loader does not map
+  one, and no member of it is pulled, so the names it defines come back as
+  undefined references. A path that names the archive works, through `input/`.
+  vcc's own driver does this sweep in its `main.v` today, and the high entry needs
+  it before a caller can drop that code.
 
 ## 0.2.0: a linker another tree can use
 
