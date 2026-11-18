@@ -1,7 +1,10 @@
 # V compiles a `v run` script into a binary beside it, and a test file is
 # compiled into a binary next to the source. Neither is content.
+#
+# `target/` is not on this list: it is the module that holds the machine and
+# system facts a link reads, and this tree builds nothing into a directory of
+# that name.
 /build
-/target
 *.o
 *.a
 
