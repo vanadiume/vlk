@@ -9,7 +9,7 @@ module target
 // a guess, so a caller on an unknown machine is told so instead of being linked
 // an image it cannot run.
 pub fn host() ?Target {
-	$if x86_64 && linux {
+	$if amd64 && linux {
 		return Target{
 			name:         'x86_64-linux'
 			word_size:    8
@@ -18,8 +18,7 @@ pub fn host() ?Target {
 			load_base:    0x400000
 			interpreter:  '/lib64/ld-linux-x86-64.so.2'
 			base_library: 'libc.so.6'
-			library_dirs: ['/usr/local/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib',
-				'/lib']
+			library_dirs: ['/usr/local/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib', '/lib']
 		}
 	} $else {
 		return none
