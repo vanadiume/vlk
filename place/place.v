@@ -83,16 +83,16 @@ pub fn lay(units []unit.Program, globals_alignment int, read_only_alignment int)
 	// Each fragment lands at the end of its run so far, at the alignment it asks
 	// for, which is what puts the fragment that opens `.init` and the one that
 	// closes it next to each other when no other unit carries one.
-	for unit in units {
-		layout.init_run_len = align_up(layout.init_run_len, run_alignment(unit.init_run))
+	for part in units {
+		layout.init_run_len = align_up(layout.init_run_len, run_alignment(part.init_run))
 		layout.init_run_bases << layout.init_run_len
-		layout.init_run_len += unit.init_run.len
+		layout.init_run_len += part.init_run.len
 	}
 	layout.fini_run_base = layout.init_run_len
-	for unit in units {
-		layout.fini_run_len = align_up(layout.fini_run_len, run_alignment(unit.fini_run))
+	for part in units {
+		layout.fini_run_len = align_up(layout.fini_run_len, run_alignment(part.fini_run))
 		layout.fini_run_bases << layout.init_run_len + layout.fini_run_len
-		layout.fini_run_len += unit.fini_run.len
+		layout.fini_run_len += part.fini_run.len
 	}
 	layout.text_len = layout.init_run_len + layout.fini_run_len
 	step := if globals_alignment > 0 { globals_alignment } else { 1 }
@@ -103,8 +103,8 @@ pub fn lay(units []unit.Program, globals_alignment int, read_only_alignment int)
 	// fragment a start file points at and stops at the first record whose
 	// length is zero. The fragments are packed byte to byte, the way a link packs
 	// them into one output section, because a gap of zero bytes ends the scan.
-	for unit in units {
-		run := unit.eh_frame_run
+	for part in units {
+		run := part.eh_frame_run
 		if run.base < 0 {
 			layout.eh_frame_bases << 0
 			continue
@@ -115,26 +115,26 @@ pub fn lay(units []unit.Program, globals_alignment int, read_only_alignment int)
 		layout.eh_frame_len += run.len
 	}
 	layout.string_len = layout.eh_frame_len
-	for unit in units {
+	for part in units {
 		layout.text_bases << layout.text_len
-		layout.text_len += unit.text.len
+		layout.text_len += part.text.len
 		layout.string_len = align_up(layout.string_len, string_step)
 		layout.string_bases << layout.string_len
-		layout.string_len += unit.string_blob.len
+		layout.string_len += part.string_blob.len
 		for layout.globals_len % step != 0 {
 			layout.globals_len++
 		}
 		layout.globals_bases << layout.globals_len
-		layout.globals_len += unit.globals_blob.len
+		layout.globals_len += part.globals_blob.len
 		// Thread-local storage is placed the way the writable data is, each
 		// unit at the alignment its members asked for, because a thread-local
 		// answers with its offset in this block.
-		tls_step := if unit.tls_alignment > 1 { unit.tls_alignment } else { 1 }
+		tls_step := if part.tls_alignment > 1 { part.tls_alignment } else { 1 }
 		layout.tls_len = align_up(layout.tls_len, tls_step)
 		layout.tls_bases << layout.tls_len
-		layout.tls_len += unit.tls_size
-		if unit.tls_alignment > layout.tls_alignment {
-			layout.tls_alignment = unit.tls_alignment
+		layout.tls_len += part.tls_size
+		if part.tls_alignment > layout.tls_alignment {
+			layout.tls_alignment = part.tls_alignment
 		}
 	}
 	// The constructor tables come last so that a unit's own storage keeps the
@@ -142,20 +142,20 @@ pub fn lay(units []unit.Program, globals_alignment int, read_only_alignment int)
 	// to a place the layout knows before the merge rewrites them.
 	layout.constructor_base = align_up(layout.globals_len, 8)
 	layout.globals_len = layout.constructor_base
-	for unit in units {
-		if unit.init_array.count > 0 {
+	for part in units {
+		if part.init_array.count > 0 {
 			layout.init_bases << layout.globals_len
-			layout.globals_len += unit.init_array.count * 8
-			layout.init_len += unit.init_array.count * 8
+			layout.globals_len += part.init_array.count * 8
+			layout.init_len += part.init_array.count * 8
 		} else {
 			layout.init_bases << layout.globals_len
 		}
 	}
-	for unit in units {
-		if unit.fini_array.count > 0 {
+	for part in units {
+		if part.fini_array.count > 0 {
 			layout.fini_bases << layout.globals_len
-			layout.globals_len += unit.fini_array.count * 8
-			layout.fini_len += unit.fini_array.count * 8
+			layout.globals_len += part.fini_array.count * 8
+			layout.fini_len += part.fini_array.count * 8
 		} else {
 			layout.fini_bases << layout.globals_len
 		}

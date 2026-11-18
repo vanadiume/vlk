@@ -37,8 +37,8 @@ pub:
 // starts somewhere else; a section key keeps its spelling, since the container
 // reads it as a place in a merged blob rather than as a symbol. How wide the
 // field is comes across unchanged, because the container writes that many bytes.
-pub fn relocations(unit unit.Program, unit_index int, text_base int, string_base int, globals_base int, tls_base int, init_run_base int, fini_run_base int, eh_frame_base int, tables Tables, mut out []unit.Relocation) {
-	for relocation in unit.relocations {
+pub fn relocations(part unit.Program, unit_index int, text_base int, string_base int, globals_base int, tls_base int, init_run_base int, fini_run_base int, eh_frame_base int, tables Tables, mut out []unit.Relocation) {
+	for relocation in part.relocations {
 		mut addend := relocation.addend
 		mut name := relocation.name
 		place_base := match relocation.place {
@@ -55,13 +55,13 @@ pub fn relocations(unit unit.Program, unit_index int, text_base int, string_base
 		// fragment, which the merge placed with the other units' fragments rather
 		// than with its own unit's text.
 		if relocation.place == .text {
-			field = text_field(unit, relocation.offset, text_base, init_run_base, fini_run_base)
+			field = text_field(part, relocation.offset, text_base, init_run_base, fini_run_base)
 		}
 		// A field inside the unit's `.eh_frame` fragment moves with the gathered
 		// table, which the merge laid out with the other units' fragments rather
 		// than where this unit's read-only data landed.
 		if relocation.place == .read_only {
-			if at := eh_frame_field(unit, relocation.offset, eh_frame_base) {
+			if at := eh_frame_field(part, relocation.offset, eh_frame_base) {
 				field = at
 			}
 		}
@@ -75,7 +75,7 @@ pub fn relocations(unit unit.Program, unit_index int, text_base int, string_base
 				addend += text_base
 			}
 			unit.section_key_rodata {
-				if at := eh_frame_field(unit, addend, eh_frame_base) {
+				if at := eh_frame_field(part, addend, eh_frame_base) {
 					addend = at
 				} else {
 					addend += string_base
@@ -85,7 +85,7 @@ pub fn relocations(unit unit.Program, unit_index int, text_base int, string_base
 				addend += globals_base
 			}
 			else {
-				name = label_key(unit, unit_index, relocation.name)
+				name = label_key(part, unit_index, relocation.name)
 			}
 		}
 		out << unit.Relocation{
@@ -107,22 +107,22 @@ pub fn relocations(unit unit.Program, unit_index int, text_base int, string_base
 // when it is inside the part of it that is this unit's `.eh_frame` fragment. The
 // merge gathers those fragments into one table, and a scan from any one of them
 // has to reach the rest, so a field inside one moves with it.
-fn eh_frame_field(unit unit.Program, offset int, eh_frame_base int) ?int {
-	run := unit.eh_frame_run
+fn eh_frame_field(part unit.Program, offset int, eh_frame_base int) ?int {
+	run := part.eh_frame_run
 	if run.base < 0 || offset < run.base || offset > run.base + run.len {
 		return none
 	}
 	return eh_frame_base + (offset - run.base)
 }
 
-fn text_field(unit unit.Program, offset int, text_base int, init_run_base int, fini_run_base int) int {
-	if unit.init_run.len > 0 && offset >= unit.init_run.base
-		&& offset < unit.init_run.base + unit.init_run.len {
-		return init_run_base + (offset - unit.init_run.base)
+fn text_field(part unit.Program, offset int, text_base int, init_run_base int, fini_run_base int) int {
+	if part.init_run.len > 0 && offset >= part.init_run.base
+		&& offset < part.init_run.base + part.init_run.len {
+		return init_run_base + (offset - part.init_run.base)
 	}
-	if unit.fini_run.len > 0 && offset >= unit.fini_run.base
-		&& offset < unit.fini_run.base + unit.fini_run.len {
-		return fini_run_base + (offset - unit.fini_run.base)
+	if part.fini_run.len > 0 && offset >= part.fini_run.base
+		&& offset < part.fini_run.base + part.fini_run.len {
+		return fini_run_base + (offset - part.fini_run.base)
 	}
 	return text_base + offset
 }
@@ -145,13 +145,13 @@ fn table_field(offset int, tables Tables) ?int {
 
 // fixups appends one unit's rewritten code references to the merged list. The
 // caller sizes that list once so no intermediate array is built per unit.
-pub fn fixups(unit unit.Program, unit_index int, text_base int, mut out []unit.Fixup) {
-	for fixup in unit.fixups {
+pub fn fixups(part unit.Program, unit_index int, text_base int, mut out []unit.Fixup) {
+	for fixup in part.fixups {
 		out << unit.Fixup{
 			start:    fixup.start + text_base
 			length:   fixup.length
 			kind:     fixup.kind
-			name:     reference_name(unit, unit_index, fixup.kind, fixup.name)
+			name:     reference_name(part, unit_index, fixup.kind, fixup.name)
 			register: fixup.register
 		}
 	}
@@ -170,8 +170,8 @@ pub fn fixups(unit unit.Program, unit_index int, text_base int, mut out []unit.F
 // to find. A reference that already names a function or an object this unit
 // defines, and that definition is private, is renamed to the key the merged
 // table holds it under.
-pub fn data_fixups(unit unit.Program, unit_index int, globals_base int, text_base int, string_base int, definitions map[string]symbols.Definition, mut out []unit.DataFixup) {
-	for fixup in unit.data_fixups {
+pub fn data_fixups(part unit.Program, unit_index int, globals_base int, text_base int, string_base int, definitions map[string]symbols.Definition, mut out []unit.DataFixup) {
+	for fixup in part.data_fixups {
 		mut kind := fixup.kind
 		mut name := fixup.name
 		mut addend := fixup.addend
@@ -204,9 +204,9 @@ pub fn data_fixups(unit unit.Program, unit_index int, globals_base int, text_bas
 				kind = if definition.function { .function_address } else { .global_address }
 			}
 		} else if fixup.kind == .function_address {
-			name = label_key(unit, unit_index, fixup.name)
+			name = label_key(part, unit_index, fixup.name)
 		} else if fixup.kind == .global_address {
-			name = object_key(unit, unit_index, fixup.name)
+			name = object_key(part, unit_index, fixup.name)
 		}
 		out << unit.DataFixup{
 			offset: fixup.offset + globals_base
@@ -237,13 +237,13 @@ fn names_a_string_literal(kind unit.FixupKind) bool {
 // top-level object takes object_key, and every other kind names string content
 // or a bit pattern rather than a unit symbol, so it is left alone. A call or an
 // address of an import is left alone too: an import is never private.
-fn reference_name(unit unit.Program, unit_index int, kind unit.FixupKind, name string) string {
+fn reference_name(part unit.Program, unit_index int, kind unit.FixupKind, name string) string {
 	match kind {
 		.call_local, .jump_local, .branch_zero, .branch_nonzero, .function_address {
-			return label_key(unit, unit_index, name)
+			return label_key(part, unit_index, name)
 		}
 		.global_address {
-			return object_key(unit, unit_index, name)
+			return object_key(part, unit_index, name)
 		}
 		else {
 			return name
@@ -262,11 +262,11 @@ fn reference_name(unit unit.Program, unit_index int, kind unit.FixupKind, name s
 // bare name, and so does a name this unit does not hold at all: the process
 // stub's one code reference calls the entry function, which another unit
 // defines.
-fn label_key(unit unit.Program, unit_index int, name string) string {
-	if name in unit.internal {
+fn label_key(part unit.Program, unit_index int, name string) string {
+	if name in part.internal {
 		return symbols.private_key(unit_index, name)
 	}
-	if name in unit.labels && name !in unit.defined {
+	if name in part.labels && name !in part.defined {
 		return symbols.private_key(unit_index, name)
 	}
 	return name
@@ -275,8 +275,8 @@ fn label_key(unit unit.Program, unit_index int, name string) string {
 // object_key is the same for a reference to a top-level object: internal
 // linkage makes the storage private to the unit and the reference takes the
 // unit's key, and anything else keeps the merged table's own name.
-fn object_key(unit unit.Program, unit_index int, name string) string {
-	if name in unit.internal {
+fn object_key(part unit.Program, unit_index int, name string) string {
+	if name in part.internal {
 		return symbols.private_key(unit_index, name)
 	}
 	return name

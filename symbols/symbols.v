@@ -18,7 +18,7 @@ import unit
 // which of two definitions of one name wins.
 pub struct Definition {
 pub:
-	unit     int
+	part     int
 	function bool
 	weak     bool
 	// tls says the definition is a thread-local rather than a function or an
@@ -92,8 +92,8 @@ pub mut:
 // other, so two units may hold one each and neither may answer for the other. A
 // C identifier cannot hold a colon, so a key built this way cannot meet a name
 // a program wrote.
-pub fn private_key(unit int, name string) string {
-	return '${unit}:${name}'
+pub fn private_key(part int, name string) string {
+	return '${part}:${name}'
 }
 
 // collect builds the union of the units' symbol tables and resolves each name a
@@ -111,11 +111,11 @@ pub fn collect(units []unit.Program) !Names {
 		weak_imports:   map[string]bool{}
 		tls_slots:      map[string]bool{}
 	}
-	for i, unit in units {
-		for name, _ in unit.hidden {
+	for i, part in units {
+		for name, _ in part.hidden {
 			names.hidden[name] = true
 		}
-		for name, _ in unit.defined {
+		for name, _ in part.defined {
 			names.defined[name] = true
 			// A function with internal linkage belongs to its unit and to no
 			// other, so it is recorded under a key no other unit can name. Two
@@ -124,11 +124,11 @@ pub fn collect(units []unit.Program) !Names {
 			// refuses. Recording it under the bare name would also let it
 			// satisfy another unit's import of the same name, which internal
 			// linkage does not do (6.2.2p2).
-			key := if name in unit.internal { private_key(i, name) } else { name }
+			key := if name in part.internal { private_key(i, name) } else { name }
 			record(mut names.definitions, key, Definition{
-				unit:     i
+				part:     i
 				function: true
-				weak:     unit.weak[name]
+				weak:     part.weak[name]
 			})!
 		}
 		// A name in `globals` is a definition only when this unit holds its
@@ -137,83 +137,83 @@ pub fn collect(units []unit.Program) !Names {
 		// storage is a copy of a library's. Such a name is not a definition
 		// here, and the unit that defines it is the one that has a slot and no
 		// copy record.
-		for name, _ in unit.globals {
-			if name in unit.copy_objects {
+		for name, _ in part.globals {
+			if name in part.copy_objects {
 				continue
 			}
 			// A thread-local is not storage in the writable data, and a unit
 			// that carries one records it in `tls_labels` instead, which the
 			// loop below reads. It is skipped here so one name is not two
 			// definitions of one unit.
-			if name in unit.tls_labels {
+			if name in part.tls_labels {
 				continue
 			}
 			// An object with internal linkage is private for the same reason
 			// the function above is: two units may each hold a `static` object
 			// of one name, and they are two objects with storage of their own.
-			key := if name in unit.internal { private_key(i, name) } else { name }
+			key := if name in part.internal { private_key(i, name) } else { name }
 			record(mut names.definitions, key, Definition{
-				unit: i
-				weak: unit.weak[name]
+				part: i
+				weak: part.weak[name]
 			})!
 		}
 		// An object in read-only data is a definition too, and it is the one a
 		// `const` object at file scope makes: one unit writes the bytes, another
 		// names them, and the reference has to land on the merged read-only data
 		// rather than on the writable data a non-const object would live in.
-		for name, _ in unit.read_only_globals {
-			key := if name in unit.internal { private_key(i, name) } else { name }
+		for name, _ in part.read_only_globals {
+			key := if name in part.internal { private_key(i, name) } else { name }
 			record(mut names.definitions, key, Definition{
-				unit:      i
-				weak:      unit.weak[name]
+				part:      i
+				weak:      part.weak[name]
 				read_only: true
 			})!
 		}
 		// A thread-local a unit defines is a definition like any other: the
 		// name binds to the unit that holds the storage, and the offset it
 		// answers with counts from the merged block rather than from a blob.
-		for name, _ in unit.tls_labels {
-			key := if name in unit.internal { private_key(i, name) } else { name }
+		for name, _ in part.tls_labels {
+			key := if name in part.internal { private_key(i, name) } else { name }
 			record(mut names.definitions, key, Definition{
-				unit: i
-				weak: unit.weak[name]
+				part: i
+				weak: part.weak[name]
 				tls:  true
 			})!
 		}
-		for name, _ in unit.internal {
+		for name, _ in part.internal {
 			names.internal[name] = true
 		}
-		for name in unit.imports {
+		for name in part.imports {
 			if name !in names.imports {
 				names.imports << name
 			}
 		}
-		for name, _ in unit.object_imports {
+		for name, _ in part.object_imports {
 			if name in names.imports {
 				names.object_imports[name] = true
 			}
 		}
-		for name, _ in unit.weak_imports {
+		for name, _ in part.weak_imports {
 			names.weak_imports[name] = true
 		}
-		for name, _ in unit.tls_slots {
+		for name, _ in part.tls_slots {
 			names.tls_slots[name] = true
 		}
-		for name in unit.libraries {
+		for name in part.libraries {
 			if name !in names.libraries {
 				names.libraries << name
 			}
 		}
-		for name in unit.copy_objects {
+		for name in part.copy_objects {
 			if name !in names.copy_objects {
 				names.copy_objects << name
 			}
 		}
-		if unit.globals_alignment > names.globals_alignment {
-			names.globals_alignment = unit.globals_alignment
+		if part.globals_alignment > names.globals_alignment {
+			names.globals_alignment = part.globals_alignment
 		}
-		if unit.read_only_alignment > names.read_only_alignment {
-			names.read_only_alignment = unit.read_only_alignment
+		if part.read_only_alignment > names.read_only_alignment {
+			names.read_only_alignment = part.read_only_alignment
 		}
 	}
 	// The weak names are the ones the resolved definition carries, not the ones
