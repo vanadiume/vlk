@@ -22,7 +22,7 @@ directory's own name. The registry entry is `vanadiume.vlk`, which installs unde
 imports are the flat ones (`import unit`), and a program in this tree writes
 `vlk.link` because the module is the root of the package.
 
-## The two constraints
+## The three constraints
 
 1. **Pure V.** No C source, no `#include`, no `#flag`, no `C.`, and no outside
    linker invoked to do the work. This is the rule vcc is held to, and a
@@ -38,11 +38,20 @@ imports are the flat ones (`import unit`), and a program in this tree writes
    on the same inputs. Never claim a change is faster or slower from the shape
    of the code; run it and print the number.
 
+3. **No garbage collector.** This library is compiled into the program that uses
+   it, and that program may be built with `-gc none` the way vcc is built.
+   Nothing here may depend on a collection running: a buffer belongs to whoever
+   allocated it and is handed on, never released by being forgotten, and no
+   allocation is made on the strength of a collector reclaiming it. The gate runs
+   the suite both ways, so leaning on the collector fails a step here instead of
+   failing a consumer's build later.
+
 ## Commands
 
 ```sh
 v test .                  # the suite; a test sits beside the module it tests
-v run tools/gate.vsh      # formatting, pure V, the suite, links between documents
+v -gc none test .         # the same, with no collector: the way a consumer is built
+v run tools/gate.vsh      # formatting, pure V, both suites, links between documents
 v fmt -w .                # format before committing
 ```
 
@@ -62,6 +71,8 @@ systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 v test .
 | `unit/` | the model of one input: text, data, the names defined and needed, and the references left to settle. Holds no target facts and reads no file. |
 | `object/` | a relocatable object file in, a unit out. The only place that reads ELF as input. |
 | `archive/` | an `ar` archive: its members, and the index that says which member answers a name. |
+| `library/` | a shared object as a link's input: the `-l` search, the ld scripts, the name the loader knows, and the symbols it defines. |
+| `input/` | the paths of a link, read into units: an object is a unit, an archive gives up the members a name needs, a shared object is recorded. |
 | `elf/` | the container format: constants, headers, sections, the dynamic table, and the code that writes an image. |
 | `symbols/` | names across units: what each means, which one wins, and where it is. Never scans a list where a map answers. |
 | `place/` | the layout: where each unit's code, data and tables land. Decides no reference. |
@@ -127,8 +138,8 @@ writes.
 
 `area: what changed`, lowercase, no trailing period, and a body that says why.
 One logical change per commit, each one building on its own. Areas in use:
-`vlk`, `unit`, `object`, `archive`, `elf`, `symbols`, `place`, `reloc`,
-`output`, `target`, `tools`, `tree`, `docs`.
+`vlk`, `unit`, `object`, `archive`, `library`, `input`, `elf`, `symbols`,
+`place`, `reloc`, `output`, `target`, `tools`, `tree`, `docs`.
 
 ## Do not
 

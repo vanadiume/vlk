@@ -3,8 +3,9 @@
 // The local gate: what a pull request has to pass, runnable before pushing so
 // that a red review is never the first news of a problem.
 //
-// Four steps, each reporting on its own line: formatting, the pure-V rule, the
-// suite, and the links between the documents in the tree. The exit status is
+// Five steps, each reporting on its own line: formatting, the pure-V rule, the
+// suite, the suite again with no garbage collector, and the links between the
+// documents in the tree. The exit status is
 // zero only when all four pass.
 //
 // There is no build step because a library has nothing to build: `v test`
@@ -32,6 +33,7 @@ fn main() {
 	report('formatting', check_formatting(root), mut failures)
 	report('pure V', check_pure_v(root), mut failures)
 	report('tests', check_tests(root), mut failures)
+	report('tests, no collector', check_tests_without_a_collector(root), mut failures)
 	report('links', check_links(root), mut failures)
 	if failures.len > 0 {
 		eprintln('')
@@ -118,7 +120,18 @@ fn check_tests(root string) []string {
 	// -nocache, not `v test .`: the module cache makes a run depend on which C
 	// compiler V picked for each file, and a failing suite that clears itself on
 	// a cold cache wastes the reader's afternoon.
-	result := run(['v', '-nocache', 'test', root])
+	return test_failures(run(['v', '-nocache', 'test', root]))
+}
+
+// check_tests_without_a_collector is the same suite compiled the way the program
+// that links through this library is built: `-gc none`, no collector at all. A
+// library that leaned on a collection running would pass the first step and break
+// every build of its consumer, so both are the bar.
+fn check_tests_without_a_collector(root string) []string {
+	return test_failures(run(['v', '-gc', 'none', '-nocache', 'test', root]))
+}
+
+fn test_failures(result CommandResult) []string {
 	if result.exit_code == 0 {
 		return []
 	}
