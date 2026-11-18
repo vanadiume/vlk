@@ -169,19 +169,22 @@ pub fn float_registers() []Register {
 	]
 }
 
-// encoders is the instruction set a container reads from this machine.
+// encoders is the instruction set a container reads from this machine. Each
+// field names the encoder by its own name rather than by the method that
+// dispatches to it: this module also declares `Target.call_near` and its
+// siblings, and a bare name here would be ambiguous between the two.
 pub fn encoders() Encoders {
 	return Encoders{
-		call_near:            call_near
-		call_slot:            call_slot
-		jump:                 jump
-		jump_slot:            jump_slot
-		jump_if_zero:         jump_if_zero
-		jump_if_not_zero:     jump_if_not_zero
-		address_of:           address_of
-		load_slot_value:      load_slot_value
-		load_double_constant: load_double_constant
-		load_float_constant:  load_float_constant
+		call_near:            encode_call_near
+		call_slot:            encode_call_slot
+		jump:                 encode_jump
+		jump_slot:            encode_jump_slot
+		jump_if_zero:         encode_jump_if_zero
+		jump_if_not_zero:     encode_jump_if_not_zero
+		address_of:           encode_address_of
+		load_slot_value:      encode_load_slot_value
+		load_double_constant: encode_load_double_constant
+		load_float_constant:  encode_load_float_constant
 	}
 }
 
@@ -200,35 +203,35 @@ fn displacement(value i32) []u8 {
 	return [u8(bits & 0xff), u8((bits >> 8) & 0xff), u8((bits >> 16) & 0xff), u8((bits >> 24) & 0xff)]
 }
 
-fn call_near(disp i32) []u8 {
+fn encode_call_near(disp i32) []u8 {
 	return bytes_with_displacement([u8(0xe8)], disp)
 }
 
-fn call_slot(disp i32) []u8 {
+fn encode_call_slot(disp i32) []u8 {
 	return bytes_with_displacement([u8(0xff), u8(0x15)], disp)
 }
 
-fn jump_slot(disp i32) []u8 {
+fn encode_jump_slot(disp i32) []u8 {
 	return bytes_with_displacement([u8(0xff), u8(0x25)], disp)
 }
 
-fn jump(disp i32) []u8 {
+fn encode_jump(disp i32) []u8 {
 	return bytes_with_displacement([u8(0xe9)], disp)
 }
 
 // jump_if_zero and jump_if_not_zero are `je` and `jne` at their five-byte form:
 // a two-byte opcode and the same four-byte distance. The short form would not
 // reach a reference's distance, and its length would depend on where it points.
-fn jump_if_zero(disp i32) []u8 {
+fn encode_jump_if_zero(disp i32) []u8 {
 	return bytes_with_displacement([u8(0x0f), u8(0x84)], disp)
 }
 
-fn jump_if_not_zero(disp i32) []u8 {
+fn encode_jump_if_not_zero(disp i32) []u8 {
 	return bytes_with_displacement([u8(0x0f), u8(0x85)], disp)
 }
 
 // address_of is `lea reg, [rip + disp]`: the address of a byte in the image.
-fn address_of(reg Register, disp i32) []u8 {
+fn encode_address_of(reg Register, disp i32) []u8 {
 	mut rex := u8(0x48) // REX.W: the address is a wide register
 	if reg.code >= 8 {
 		rex |= 0x04 // REX.R reaches registers the low three bits cannot name
@@ -237,7 +240,7 @@ fn address_of(reg Register, disp i32) []u8 {
 }
 
 // load_slot_value is `mov reg, [rip + disp]`: the value a slot holds.
-fn load_slot_value(reg Register, disp i32) []u8 {
+fn encode_load_slot_value(reg Register, disp i32) []u8 {
 	mut rex := u8(0x48) // REX.W: the value is a wide register
 	if reg.code >= 8 {
 		rex |= 0x04 // REX.R reaches registers the low three bits cannot name
@@ -248,11 +251,11 @@ fn load_slot_value(reg Register, disp i32) []u8 {
 // load_double_constant and load_float_constant read a constant out of the image
 // with the scalar moves: `movsd` and `movss`, with the two-byte 0f prefix the
 // machine gives an instruction in the second opcode map.
-fn load_double_constant(reg Register, disp i32) ![]u8 {
+fn encode_load_double_constant(reg Register, disp i32) ![]u8 {
 	return scalar_rip_move(0xf2, reg, disp)
 }
 
-fn load_float_constant(reg Register, disp i32) ![]u8 {
+fn encode_load_float_constant(reg Register, disp i32) ![]u8 {
 	return scalar_rip_move(0xf3, reg, disp)
 }
 
