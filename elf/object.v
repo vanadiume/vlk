@@ -1,0 +1,891 @@
+module elf
+
+import target
+import unit
+
+// The relocatable container: what `-c` writes, and what a linker reads back.
+//
+// A program and an object are the same image in two states. A program has every
+// address settled, one segment that maps whole, and a loader that finishes the
+// job. An object has none of those things: it is code and data whose addresses
+// are decided by whoever links it, so what it carries instead of settled
+// addresses is a symbol table saying what it defines and what it needs, and a
+// relocation for every place the code left a hole.
+//
+// The two share the parts that are the same in both: the header, the string
+// tables, the symbols, and the byte writers below. They differ in what those
+// parts say. A program's symbol table is dynamic and describes what the loader
+// looks up by name; an object's is static and describes what a linker resolves.
+// There is no program header table here and nothing to map, because a
+// relocatable file is not something a kernel starts.
+//
+// Every machine fact comes from the target, including the two relocation
+// numbers, which belong to a machine's psABI rather than to this format.
+
+// elf_type_rel is a relocatable file: code and data whose addresses are not
+// settled, which is what makes it an input to a link rather than a program.
+const elf_type_rel = u16(1)
+
+// The section header types this file writes. The null section's type is zero, and
+// it is written by leaving the zeroes the file was made of in place, so there is
+// no constant for it here.
+const sht_progbits = u32(1)
+const sht_symtab = u32(2)
+const sht_strtab = u32(3)
+const sht_rela = u32(4)
+
+// The section flags. A relocatable file still says which parts have to be mapped
+// together and how, even though none of them has an address yet.
+const shf_write = u64(1)
+const shf_alloc = u64(2)
+const shf_execinstr = u64(4)
+
+// The st_info bytes this file writes. st_info packs two four-bit fields: the low
+// half is what the symbol names and the high half is who may see it. The pairs
+// this object needs are a section no one refers to by name, an object anything
+// may refer to, and, from elf.v, the function those two sit beside.
+const symbol_local_section = u8(0x03) // binding local (0), type section (3)
+// A definition with internal linkage wears the local binding (0) with the type
+// of what it names, an object (1) or a function (2). It is what a file-scope
+// `static` gives a name (6.2.2p3), and it is the byte that keeps such a
+// definition from meeting another translation unit's.
+const symbol_local_object = u8(0x01) // binding local (0), type object (1)
+const symbol_local_function = u8(0x02) // binding local (0), type function (2)
+const symbol_global_object = u8(0x11) // binding global (1), type object (1)
+// A weak definition is one a link may replace rather than one that collides with
+// a second: the same names with the weak binding (2) in the upper nibble. It is
+// what `__attribute__((weak))` on a definition asks for.
+const symbol_weak_object = u8(0x21) // binding weak (2), type object (1)
+
+// st_other carries the symbol's visibility in its low two bits. STV_HIDDEN is
+// what `__attribute__((visibility("hidden")))` asks for: the symbol is still
+// global, and a linker reading it does not export the name from the image it
+// builds. The default is zero, so a name without the attribute writes none.
+const symbol_hidden = u8(2)
+
+// shn_undef is the section a symbol has when this object does not define it: its
+// definition is somewhere the linker still has to look.
+const shn_undef = u16(0)
+
+const elf_section_header_size = 64
+
+// The section numbers, in the order they are written. The null section every ELF
+// file has is number zero, and it is not a place: it is what a symbol with no
+// section behind it names, so the table cannot start anywhere else, and nothing
+// here counts it.
+const section_text = 1
+const section_rela_text = 2
+const section_rodata = 3
+const section_data = 4
+const section_symtab = 5
+const section_strtab = 6
+const section_shstrtab = 7
+// The note that states the stack permission. It holds nothing: the section's
+// SHF_EXECINSTR flag is the answer, set when the code runs instructions it wrote
+// into its own frame. A linker that does not find the section at all has to
+// assume the worst and asks about it.
+const section_gnu_stack = 8
+// The relocations against the writable data: one per eight bytes of a top-level
+// object that hold an address rather than a number, which is what a file-scope
+// pointer initializer is. They sit in a table of their own because a relocation
+// is against one section, and these are against .data.
+const section_rela_data = 9
+// The unwind table: how a stack walker finds the frame of every function this
+// object defines. It follows the read-only data because a program's copy of it
+// is read-only, and its relocations live in the same kind of table as the
+// code's, against .eh_frame rather than against .text.
+const section_eh_frame = 10
+const section_rela_eh_frame = 11
+const section_count = 12
+
+// The three symbols every object has before its own: one per section a reference
+// can be made against. A reference to a string is a reference to .rodata at an
+// offset, and the section symbol is what says so.
+const symbol_text_section = 1
+const symbol_rodata_section = 2
+const symbol_data_section = 3
+// first_global_symbol is one past the null entry and the three section symbols:
+// where this object's own definitions begin. A definition with internal linkage
+// sits here and is still a local, so the boundary a linker reads as the first
+// global symbol is counted when the table is built and is this number only when
+// the unit defines no static name.
+const first_global_symbol = 4
+
+// NameOffsets is where each section's name landed in .shstrtab.
+struct NameOffsets {
+	text      int
+	rela      int
+	rodata    int
+	data      int
+	symtab    int
+	strtab    int
+	shstrtab  int
+	gnu_stack int
+	rela_data int
+	// eh_frame is the unwind table and rela_eh_frame the relocations that
+	// fill in where each function it describes begins.
+	eh_frame      int
+	rela_eh_frame int
+}
+
+// PartSizes is how long each part of the object is. The sizes are kept apart from
+// the offsets because a part's length is not the distance to the next one: the
+// layout pads each part to an eight-byte boundary, and a section header has to
+// say how long the part is and not how much room it was given.
+struct PartSizes {
+	text   int
+	rodata int
+	data   int
+	// rela is the size of .rela.text, the relocations against the code, and
+	// rela_data is .rela.data, the ones against the writable data.
+	rela      int
+	rela_data int
+	symtab    int
+	strtab    int
+	shstrtab  int
+	// eh_frame is the unwind table, and rela_eh_frame the relocations that
+	// fill in its initial locations.
+	eh_frame      int
+	rela_eh_frame int
+}
+
+// PartOffsets is where each part of the object landed, as a file offset.
+struct PartOffsets {
+	text          int
+	rodata        int
+	data          int
+	rela          int
+	rela_data     int
+	eh_frame      int
+	rela_eh_frame int
+	symtab        int
+	strtab        int
+	shstrtab      int
+	headers       int
+	total         int
+}
+
+// ObjectRelocation is one hole the linker has to fill: where it is in .text,
+// which symbol it is against, and what the addend is. call says the reference is
+// a call, which a linker may route through a stub, rather than a distance the
+// code computes for itself. got says the reference is to the global offset table
+// entry for the symbol rather than to the symbol: the code that reads it is a
+// load of the symbol's address, which is what a position-independent object uses
+// for a symbol another object may define.
+struct ObjectRelocation {
+	offset int
+	symbol int
+	addend i64
+	call   bool
+	got    bool
+}
+
+// object wraps a program in an ELF64 relocatable object that a linker can take
+// as input. The jumps inside the text are settled here, so the writer works over
+// a copy: the caller keeps the program it handed over.
+pub fn object(program unit.Program, machine target.Target) ![]u8 {
+	return object_over(program, machine, mut program.text.clone())
+}
+
+// object_in_place wraps the same object over the program's own text, for a caller
+// that is done with the program once the object is out. What the program's text
+// holds afterwards is the object's .text, with the jumps settled, and not the code
+// the emitter wrote: the caller must not read it again.
+//
+// A `-c` run reads one program once and writes one file, and the copy the entry
+// point above makes is 67 MB on the compiler's own generated C, for a text of
+// 48 MB. Every other caller keeps the program, so the copy stays theirs.
+pub fn object_in_place(mut program unit.Program, machine target.Target) ![]u8 {
+	return object_over(program, machine, mut program.text)
+}
+
+fn object_over(program unit.Program, machine target.Target, mut text []u8) ![]u8 {
+	// The symbols, in the order the table needs them. The format wants every
+	// local before every global, so a definition with internal linkage comes
+	// first, beside the section symbols, and only the external definitions and
+	// the imports follow. Within each run the functions and the objects are
+	// sorted, so the same input gives the same bytes every run, and the imports
+	// keep the call order the emitter already fixed.
+	mut functions := program.defined.keys()
+	functions.sort()
+	mut objects := program.globals.keys()
+	objects.sort()
+	mut local_names := []string{}
+	mut global_names := []string{}
+	for name in functions {
+		if program.internal[name] {
+			local_names << name
+		} else {
+			global_names << name
+		}
+	}
+	for name in objects {
+		if program.internal[name] {
+			local_names << name
+		} else {
+			global_names << name
+		}
+	}
+	mut strtab := []u8{}
+	strtab << u8(0)
+	mut symbol_index := map[string]int{}
+	mut name_offset := map[string]int{}
+	mut symbol_count := first_global_symbol
+	for name in local_names {
+		symbol_index[name] = symbol_count
+		symbol_count++
+		name_offset[name] = intern_name(mut strtab, name)
+	}
+	// first_global is where the global symbols start, which is what the symbol
+	// table's sh_info says: every local is before it and every global after,
+	// and a static definition is what moves it past the section symbols.
+	first_global := symbol_count
+	for name in global_names {
+		symbol_index[name] = symbol_count
+		symbol_count++
+		name_offset[name] = intern_name(mut strtab, name)
+	}
+	for name in program.imports {
+		symbol_index[name] = symbol_count
+		symbol_count++
+		name_offset[name] = intern_name(mut strtab, name)
+	}
+	// The text, with the jumps inside it settled: both ends of a jump are in
+	// .text, and .text is moved as a unit when it is linked, so the distance
+	// between two places in it is the same afterwards as it is now. Those need
+	// no relocation. Everything else does.
+	mut relocations := []ObjectRelocation{}
+	for fixup in program.fixups {
+		instruction := fixup.start
+		// A relocation names the four bytes the linker writes into, which is the
+		// field and not the instruction: the instruction's other bytes are an
+		// opcode and its addressing form. Every reference the emitter writes
+		// puts a four-byte field at the end of the instruction, so the field is
+		// always the last four bytes of it.
+		field := instruction + fixup.length - 4
+		match fixup.kind {
+			.call_local {
+				symbol := symbol_index[fixup.name] or {
+					return error('${fixup.name} is called but this object defines no such function')
+				}
+				relocations << ObjectRelocation{
+					offset: field
+					symbol: symbol
+					addend: -4
+					call:   true
+				}
+			}
+			.call_import {
+				symbol := symbol_index[fixup.name] or {
+					return error('${fixup.name} is called but was never imported')
+				}
+				relocations << ObjectRelocation{
+					offset: field
+					symbol: symbol
+					addend: -4
+					call:   true
+				}
+			}
+			.take_address, .take_wide_address, .float_constant, .single_constant {
+				// A string and a floating constant are both read-only data at
+				// an offset, so they are the same reference: .rodata at the
+				// offset the emitter interned them at. A wide string is the
+				// same reference again, out of its own table.
+				where := match fixup.kind {
+					.take_address {
+						program.strings[fixup.name] or {
+							return error('no string ${fixup.name} in the object')
+						}
+					}
+					.take_wide_address {
+						program.wide_strings[fixup.name] or {
+							return error('no wide string ${fixup.name} in the object')
+						}
+					}
+					else {
+						program.doubles[fixup.name] or {
+							return error('no floating constant ${fixup.name} in the object')
+						}
+					}
+				}
+				relocations << ObjectRelocation{
+					offset: field
+					symbol: symbol_rodata_section
+					addend: i64(where) - 4
+					call:   false
+				}
+			}
+			.function_address {
+				// A label the emitter made is a place in this unit's own
+				// .text, which the link moves as a unit, so the distance from
+				// the field to it is settled here, the same way a jump inside
+				// .text is. A function name is a symbol another unit may also
+				// name, so its address is left as a relocation against it.
+				if fixup.name !in symbol_index {
+					if where := program.labels[fixup.name] {
+						register := machine.reg(fixup.register) or {
+							return error('no register named ${fixup.register} to compute an address into')
+						}
+						disp := i32(where - (instruction + fixup.length))
+						replacement := machine.address_of(register, disp)
+						if replacement.len != fixup.length {
+							return error('the address of ${fixup.name} was ${fixup.length} bytes and became ${replacement.len}')
+						}
+						put(mut text, instruction, replacement)
+						continue
+					}
+				}
+				symbol := symbol_index[fixup.name] or {
+					return error('${fixup.name} is addressed but this object defines no such name')
+				}
+				relocations << ObjectRelocation{
+					offset: field
+					symbol: symbol
+					addend: -4
+					call:   false
+				}
+			}
+			.global_address, .import_address {
+				symbol := symbol_index[fixup.name] or {
+					return error('${fixup.name} is addressed but this object defines no such name')
+				}
+				relocations << ObjectRelocation{
+					offset: field
+					symbol: symbol
+					addend: -4
+					call:   false
+				}
+			}
+			.got_address {
+				// The instruction loads the object's address out of the table
+				// entry the linker builds for it, so the reference is to the
+				// symbol through the table rather than to the symbol: the
+				// relocation names the symbol and says the distance is to its
+				// GOT entry. It is what a position-independent object writes
+				// for a name another object may define, and the linker refuses
+				// it only when the symbol turns out not to be preemptible at
+				// link time, where a direct reference is refused outright.
+				symbol := symbol_index[fixup.name] or {
+					return error('${fixup.name} is reached through the global offset table but this object defines no such name')
+				}
+				relocations << ObjectRelocation{
+					offset: field
+					symbol: symbol
+					addend: -4
+					call:   false
+					got:    true
+				}
+			}
+			.jump_local, .branch_zero, .branch_nonzero {
+				where := program.labels[fixup.name] or {
+					return error('no code for ${fixup.name}')
+				}
+				disp := i32(where - (instruction + fixup.length))
+				replacement := match fixup.kind {
+					.jump_local { machine.jump(disp) }
+					.branch_zero { machine.jump_if_zero(disp) }
+					else { machine.jump_if_not_zero(disp) }
+				}
+				if replacement.len != fixup.length {
+					return error('the jump to ${fixup.name} was ${fixup.length} bytes and became ${replacement.len}')
+				}
+				put(mut text, instruction, replacement)
+			}
+		}
+	}
+	// The references inside the writable data are the eight bytes of an address
+	// each, and a relocatable file has no addresses: whichever symbol the bytes
+	// name is what the linker resolves, and the addend is zero because the value
+	// is the address itself rather than a distance from the field.
+	mut data_relocations := []ObjectRelocation{}
+	for fixup in program.data_fixups {
+		match fixup.kind {
+			.take_address, .take_wide_address {
+				where := if fixup.kind == .take_address {
+					program.strings[fixup.name] or {
+						return error('no string ${fixup.name} in the object')
+					}
+				} else {
+					program.wide_strings[fixup.name] or {
+						return error('no wide string ${fixup.name} in the object')
+					}
+				}
+				data_relocations << ObjectRelocation{
+					offset: fixup.offset
+					symbol: symbol_rodata_section
+					addend: i64(where) + fixup.addend
+					call:   false
+				}
+			}
+			.function_address, .global_address, .import_address {
+				symbol := symbol_index[fixup.name] or {
+					return error('${fixup.name} is addressed in the data but this object defines no such name')
+				}
+				data_relocations << ObjectRelocation{
+					offset: fixup.offset
+					symbol: symbol
+					addend: i64(fixup.addend)
+					call:   false
+				}
+			}
+			else {
+				return error('the data reference to ${fixup.name} is not one this object can carry')
+			}
+		}
+	}
+	// The unwind table: one CIE stating the rule every function this unit
+	// emits follows, and one FDE per function body saying where it lies and
+	// how long it is. The addresses belong to the link, so each FDE's initial
+	// location is left to a relocation against .text.
+	eh_frame, eh_frame_relocations := unwind_table(program)
+	names, shstrtab := section_names()
+	sizes := PartSizes{
+		text:          text.len
+		rodata:        program.string_blob.len
+		data:          program.globals_blob.len
+		rela:          relocations.len * elf_relocation_size
+		rela_data:     data_relocations.len * elf_relocation_size
+		eh_frame:      eh_frame.len
+		rela_eh_frame: eh_frame_relocations.len * elf_relocation_size
+		symtab:        symbol_count * elf_symbol_size
+		strtab:        strtab.len
+		shstrtab:      shstrtab.len
+	}
+	parts := place(sizes)
+	mut output := []u8{len: parts.total, init: u8(0)}
+	put(mut output, parts.text, text)
+	put(mut output, parts.rodata, program.string_blob)
+	put(mut output, parts.data, program.globals_blob)
+	put(mut output, parts.eh_frame, eh_frame)
+	emit_object_relocations(mut output, parts, relocations, machine)
+	emit_object_data_relocations(mut output, parts, data_relocations)
+	emit_object_eh_frame_relocations(mut output, parts, eh_frame_relocations, machine)
+	emit_object_symbols(mut output, parts, program, local_names, global_names, symbol_index,
+		name_offset)
+	put(mut output, parts.strtab, strtab)
+	put(mut output, parts.shstrtab, shstrtab)
+	// An object whose declaration asked for a strict alignment has to have its
+	// section say so, because the section's own alignment is what decides where
+	// a linker places it and therefore where the object starts.
+	data_alignment := if program.globals_alignment > 8 {
+		u64(program.globals_alignment)
+	} else {
+		u64(8)
+	}
+	emit_object_section_headers(mut output, parts, sizes, names, data_alignment, first_global,
+		program.executable_stack)
+	emit_object_header(mut output, machine, parts)
+	return output
+}
+
+// section_names builds .shstrtab and remembers where each name landed in it. The
+// null byte comes first because offset zero has to mean no name.
+fn section_names() (NameOffsets, []u8) {
+	mut table := []u8{}
+	table << u8(0)
+	text := intern_name(mut table, '.text')
+	rela := intern_name(mut table, '.rela.text')
+	rodata := intern_name(mut table, '.rodata')
+	data := intern_name(mut table, '.data')
+	symtab := intern_name(mut table, '.symtab')
+	strtab := intern_name(mut table, '.strtab')
+	shstrtab := intern_name(mut table, '.shstrtab')
+	gnu_stack := intern_name(mut table, '.note.GNU-stack')
+	rela_data := intern_name(mut table, '.rela.data')
+	eh_frame := intern_name(mut table, '.eh_frame')
+	rela_eh_frame := intern_name(mut table, '.rela.eh_frame')
+	return NameOffsets{
+		text:          text
+		rela:          rela
+		rodata:        rodata
+		data:          data
+		symtab:        symtab
+		strtab:        strtab
+		shstrtab:      shstrtab
+		gnu_stack:     gnu_stack
+		rela_data:     rela_data
+		eh_frame:      eh_frame
+		rela_eh_frame: rela_eh_frame
+	}, table
+}
+
+// intern_name adds a name to a string table and answers where it starts.
+fn intern_name(mut table []u8, name string) int {
+	at := table.len
+	table << name.bytes()
+	table << u8(0)
+	return at
+}
+
+// place puts every part of the object one after another at an eight-byte
+// boundary. Nothing is rounded up to a page, because nothing here is mapped: the
+// file is read by a linker and not by a kernel.
+fn place(sizes PartSizes) PartOffsets {
+	mut offset := int(elf_header_size)
+	text := offset
+	offset = align(offset + sizes.text, 8)
+	rodata := offset
+	offset = align(offset + sizes.rodata, 8)
+	data := offset
+	offset = align(offset + sizes.data, 8)
+	eh_frame := offset
+	offset = align(offset + sizes.eh_frame, 8)
+	rela := offset
+	offset = align(offset + sizes.rela, 8)
+	rela_data := offset
+	offset = align(offset + sizes.rela_data, 8)
+	rela_eh_frame := offset
+	offset = align(offset + sizes.rela_eh_frame, 8)
+	symtab := offset
+	offset = align(offset + sizes.symtab, 8)
+	strtab := offset
+	offset = align(offset + sizes.strtab, 8)
+	shstrtab := offset
+	offset = align(offset + sizes.shstrtab, 8)
+	headers := offset
+	return PartOffsets{
+		text:          text
+		rodata:        rodata
+		data:          data
+		eh_frame:      eh_frame
+		rela:          rela
+		rela_data:     rela_data
+		rela_eh_frame: rela_eh_frame
+		symtab:        symtab
+		strtab:        strtab
+		shstrtab:      shstrtab
+		headers:       headers
+		total:         offset + section_count * elf_section_header_size
+	}
+}
+
+// emit_object_relocations writes one relocation per hole: the place in .text,
+// the symbol it is against packed together with the kind of reference it is, and
+// the addend. The addend is -4 for every reference whose instruction reads the
+// field as a distance from its own end, which is each of them here: the four
+// bytes of the field are counted from the address after them, and for a
+// reference to data the object's offset goes on top of that.
+fn emit_object_relocations(mut output []u8, parts PartOffsets, relocations []ObjectRelocation, machine target.Target) {
+	for i, relocation in relocations {
+		at := parts.rela + i * elf_relocation_size
+		kind := if relocation.call {
+			machine.call_relocation()
+		} else if relocation.got {
+			machine.got_relocation()
+		} else {
+			machine.address_relocation()
+		}
+		put_u64(mut output, at, u64(relocation.offset))
+		put_u64(mut output, at + 8, (u64(relocation.symbol) << 32) | u64(kind))
+		put_u64(mut output, at + 16, u64(relocation.addend))
+	}
+}
+
+// emit_object_data_relocations writes the holes in the writable data the same
+// way, but against .data: the field is the eight bytes the address goes in, the
+// reference is an absolute address rather than a distance, and the addend is the
+// byte a part of the object starts at. The relocation is R_X86_64_64, the psABI's
+// one for a slot that holds the symbol's value plus the addend, which is what gcc
+// 16.2.1 writes for the same initializer.
+fn emit_object_data_relocations(mut output []u8, parts PartOffsets, relocations []ObjectRelocation) {
+	for i, relocation in relocations {
+		at := parts.rela_data + i * elf_relocation_size
+		put_u64(mut output, at, u64(relocation.offset))
+		put_u64(mut output, at + 8, (u64(relocation.symbol) << 32) | relocation_absolute)
+		put_u64(mut output, at + 16, u64(relocation.addend))
+	}
+}
+
+// emit_object_eh_frame_relocations writes one relocation per function the
+// unwind table describes: the four-byte initial-location field of its FDE is a
+// PC-relative distance to the function, so the field names .text at the
+// function's offset and the link writes the distance into it. The addend is the
+// function's offset in .text, which is what the section symbol's value plus the
+// addend has to come to.
+fn emit_object_eh_frame_relocations(mut output []u8, parts PartOffsets, relocations []ObjectRelocation, machine target.Target) {
+	for i, relocation in relocations {
+		at := parts.rela_eh_frame + i * elf_relocation_size
+		put_u64(mut output, at, u64(relocation.offset))
+		put_u64(mut output, at + 8, (u64(relocation.symbol) << 32) | u64(machine.address_relocation()))
+		put_u64(mut output, at + 16, u64(relocation.addend))
+	}
+}
+
+// eh_frame_cie is the one CIE the unit's unwind table carries, and the reason
+// one CIE is enough: every function this compiler emits opens with the same
+// prologue, so the rule that says where a frame begins and where its saved
+// registers are does not change from one body to the next.
+//
+// The body is captured between a pushed frame pointer and a frame reserved
+// beneath it, and the reservation is not moved again inside the body except by
+// a matching release and reserve around a call, so the canonical frame address
+// is rbp plus sixteen for the whole body. The caller's return address lies at
+// CFA minus eight, which is where the call left it, and the frame pointer this
+// function saved lies at CFA minus sixteen. The CIE states all three. The return
+// address's own rule is not optional: a walker that does not know where the
+// return address is saved cannot find the caller's program counter, and the walk
+// stops or reads a value that is not one.
+//
+// The encoding is gcc's: a version 1 frame, the standard "zR" augmentation whose
+// one byte says an FDE's initial location is a four-byte distance measured from
+// the field, code alignment 1 and data alignment -8, and the return address in
+// column 16. The entry's length comes to a multiple of four with no padding,
+// which is what lets a following entry begin there.
+fn frame_cie() []u8 {
+	mut entry := []u8{}
+	// The length of everything below it, then the identifier zero that marks
+	// this entry as a CIE rather than an FDE, then the version.
+	entry << u8(0x14)
+	entry << u8(0x00)
+	entry << u8(0x00)
+	entry << u8(0x00)
+	entry << u8(0x00)
+	entry << u8(0x00)
+	entry << u8(0x00)
+	entry << u8(0x00)
+	entry << u8(0x01)
+	// The augmentation string "zR": an FDE may carry augmentation data of its
+	// own, and one byte of this CIE's augmentation data says how an FDE's
+	// initial location is encoded.
+	entry << u8(0x7a)
+	entry << u8(0x52)
+	entry << u8(0x00)
+	// Code alignment 1, data alignment -8, and the return address in column 16.
+	entry << u8(0x01)
+	entry << u8(0x78)
+	entry << u8(0x10)
+	// One byte of augmentation data: DW_EH_PE_pcrel | DW_EH_PE_sdata4, a
+	// four-byte signed distance measured from the field itself.
+	entry << u8(0x01)
+	entry << u8(0x1b)
+	// The rule: DW_CFA_def_cfa rbp,16; DW_CFA_offset rbp,-16; and
+	// DW_CFA_offset rip,-8. The operand of an offset is divided by the data
+	// alignment, so -16 is written 2 and -8 is written 1.
+	entry << u8(0x0c)
+	entry << u8(0x06)
+	entry << u8(0x10)
+	entry << u8(0x86)
+	entry << u8(0x02)
+	entry << u8(0x90)
+	entry << u8(0x01)
+	return entry
+}
+
+// unwind_table builds the unit's `.eh_frame`: the one CIE every function points
+// at, and one FDE per function body. Each FDE names the function's place and
+// length, and says its rule is the CIE's by carrying no instructions of its own.
+//
+// The initial location is left as zero and a relocation against .text at the
+// function's offset: an object has no addresses, and the link is what writes the
+// distance the field has to hold.
+fn unwind_table(program unit.Program) ([]u8, []ObjectRelocation) {
+	// A unit with no function body has nothing to describe, and emits no table:
+	// a C compiler writes none for a translation unit with no functions, and an
+	// empty `.eh_frame` would be bytes a walker reads and finds nothing in.
+	if program.function_runs.len == 0 {
+		return []u8{}, []ObjectRelocation{}
+	}
+	mut table := frame_cie()
+	mut relocations := []ObjectRelocation{}
+	for run in program.function_runs {
+		entry := table.len
+		mut fde := []u8{len: 20, init: u8(0)}
+		put_u32(mut fde, 0, 16) // the entry below, minus these four
+		// The four bytes at offset four point back at the CIE. The value is
+		// the distance from the field to the CIE's first byte, and the CIE is
+		// the table's first bytes, so it is the field's own offset.
+		put_u32(mut fde, 4, u32(entry + 4))
+		// Offset eight is the initial location, zero until the link fills it.
+		// The four bytes at offset twelve are the length of the body.
+		put_u32(mut fde, 12, u32(run.len))
+		// Offset sixteen is the one byte of augmentation data, zero, and the
+		// three bytes after it are DW_CFA_nop padding to a four-byte length.
+		table << fde
+		relocations << ObjectRelocation{
+			offset: entry + 8
+			symbol: symbol_text_section
+			addend: i64(run.base)
+			call:   false
+		}
+	}
+	return table, relocations
+}
+
+// emit_object_symbols writes the static symbol table: the null entry the format
+// requires, one entry per section a reference can be made against, and then what
+// this object defines and what it needs. A definition with internal linkage is a
+// local and stands with the section symbols; every other definition and the
+// imports stand after it, where a linker reads symbols from. A function's value
+// is where its code begins in .text, an object's is where its storage begins in
+// .data, and an import has no value and no section, because its definition is
+// somewhere this object is not.
+fn emit_object_symbols(mut output []u8, parts PartOffsets, program unit.Program, local_names []string, global_names []string, symbol_index map[string]int, name_offset map[string]int) {
+	put_symbol(mut output, parts.symtab + symbol_text_section * elf_symbol_size, 0,
+		symbol_local_section, section_text, 0, 0)
+	put_symbol(mut output, parts.symtab + symbol_rodata_section * elf_symbol_size, 0,
+		symbol_local_section, section_rodata, 0, 0)
+	put_symbol(mut output, parts.symtab + symbol_data_section * elf_symbol_size, 0,
+		symbol_local_section, section_data, 0, 0)
+	for name in local_names {
+		// A static name is local whether it names a function or an object, and
+		// the two local bindings carry the type that tells them apart.
+		put_defined_symbol(mut output, parts, program, name, symbol_index, name_offset,
+			symbol_local_function, symbol_local_object)
+	}
+	for name in global_names {
+		// The weak binding is a separate question from linkage, so it is read
+		// here rather than carried in the two run lists.
+		function_binding := if program.weak[name] {
+			symbol_weak_function
+		} else {
+			symbol_global_function
+		}
+		object_binding := if program.weak[name] { symbol_weak_object } else { symbol_global_object }
+		put_defined_symbol(mut output, parts, program, name, symbol_index, name_offset,
+			function_binding, object_binding)
+	}
+	for name in global_names {
+		// The visibility is a separate byte from the binding and not a second
+		// binding: a hidden name is still global, and what it is not is a name
+		// another image may bind to. A linker that reads this object reads the
+		// byte and leaves the name out of what it exports.
+		if name in program.hidden {
+			output[parts.symtab + symbol_index[name] * elf_symbol_size + 5] = symbol_hidden
+		}
+	}
+	for name in program.imports {
+		at := parts.symtab + symbol_index[name] * elf_symbol_size
+		// An import is a function another object defines or an object it
+		// defines, and the type says which: both have no value and no section,
+		// because the definition is somewhere this object is not. A reader of
+		// the table that treated an object as a function would call it; the
+		// type is what says not to.
+		//
+		// The binding is the other question, and it is the one an undefined
+		// weak name answers: a linker does not have to find a definition for
+		// it and reads what names it as the address zero (ELF). That is what
+		// `__attribute__((weak))` on a declaration this object has no
+		// definition for asks the table to say.
+		info := if program.object_imports[name] {
+			if name in program.weak_imports { symbol_weak_object } else { symbol_global_object }
+		} else if name in program.weak_imports {
+			symbol_weak_function
+		} else {
+			symbol_global_function
+		}
+		put_symbol(mut output, at, name_offset[name] or { 0 }, info,
+			shn_undef, 0, 0)
+	}
+}
+
+// put_defined_symbol writes one symbol this object defines. A name in defined is
+// a function and its value is where its code begins in .text; anything else is an
+// object and its value is where its storage begins in .data. The binding byte is
+// the caller's: the local pair for a definition with internal linkage, and the
+// global or weak pair for one without.
+fn put_defined_symbol(mut output []u8, parts PartOffsets, program unit.Program, name string, symbol_index map[string]int, name_offset map[string]int, function_binding u8, object_binding u8) {
+	at := parts.symtab + symbol_index[name] * elf_symbol_size
+	if name in program.defined {
+		where := program.labels[name] or { 0 }
+		put_symbol(mut output, at, name_offset[name] or { 0 }, function_binding,
+			section_text, u64(where), 0)
+		return
+	}
+	slot := program.globals[name] or { unit.GlobalSlot{} }
+	// An object's size is one element wide, or as many elements as it was
+	// defined with.
+	width := if slot.count > 0 { slot.width * slot.count } else { slot.width }
+	put_symbol(mut output, at, name_offset[name] or { 0 }, object_binding,
+		section_data, u64(slot.offset), u64(width))
+}
+
+// put_symbol writes one 24-byte symbol table entry.
+fn put_symbol(mut output []u8, at int, name int, info u8, section u16, value u64, size u64) {
+	put_u32(mut output, at, u32(name))
+	output[at + 4] = info
+	// st_other is the symbol's visibility, which is the default here.
+	put_u16(mut output, at + 6, section)
+	put_u64(mut output, at + 8, value)
+	put_u64(mut output, at + 16, size)
+}
+
+// emit_object_section_headers writes the section header table, which a
+// relocatable file needs and a program does not: a linker reads the sections it
+// is told about, and there are no program headers to read instead.
+fn emit_object_section_headers(mut output []u8, parts PartOffsets, sizes PartSizes, names NameOffsets, data_alignment u64, first_global int, executable_stack bool) {
+	// The null section is the whole of offset zero in the table, and the zeroes
+	// the file was made of are what belongs there, so nothing is written.
+	put_section_header(mut output, parts.headers + section_text * elf_section_header_size,
+		names.text, sht_progbits, shf_alloc | shf_execinstr, parts.text, sizes.text,
+		0, 0, 16, 0)
+	put_section_header(mut output, parts.headers + section_rela_text * elf_section_header_size,
+		names.rela, sht_rela, 0, parts.rela, sizes.rela,
+		section_symtab, section_text, 8, elf_relocation_size)
+	put_section_header(mut output, parts.headers + section_rodata * elf_section_header_size,
+		names.rodata, sht_progbits, shf_alloc, parts.rodata, sizes.rodata,
+		0, 0, 8, 0)
+	put_section_header(mut output, parts.headers + section_data * elf_section_header_size,
+		names.data, sht_progbits, shf_alloc | shf_write, parts.data, sizes.data,
+		0, 0, data_alignment, 0)
+	put_section_header(mut output, parts.headers + section_symtab * elf_section_header_size,
+		names.symtab, sht_symtab, 0, parts.symtab, sizes.symtab,
+		section_strtab, u32(first_global), 8, elf_symbol_size)
+	put_section_header(mut output, parts.headers + section_strtab * elf_section_header_size,
+		names.strtab, sht_strtab, 0, parts.strtab, sizes.strtab,
+		0, 0, 1, 0)
+	put_section_header(mut output, parts.headers + section_shstrtab * elf_section_header_size,
+		names.shstrtab, sht_strtab, 0, parts.shstrtab, sizes.shstrtab,
+		0, 0, 1, 0)
+	put_section_header(mut output, parts.headers + section_gnu_stack * elf_section_header_size,
+		names.gnu_stack, sht_progbits, if executable_stack { shf_execinstr } else { 0 }, 0, 0, 0, 0, 1, 0)
+	put_section_header(mut output, parts.headers + section_rela_data * elf_section_header_size,
+		names.rela_data, sht_rela, 0, parts.rela_data, sizes.rela_data,
+		section_symtab, section_data, 8, elf_relocation_size)
+	// The unwind table is allocated and read-only, and its own relocations live
+	// beside it the way the code's do, resolved against the same symbol table
+	// and against .eh_frame rather than against .text.
+	put_section_header(mut output, parts.headers + section_eh_frame * elf_section_header_size,
+		names.eh_frame, sht_progbits, shf_alloc, parts.eh_frame, sizes.eh_frame,
+		0, 0, 8, 0)
+	put_section_header(mut output, parts.headers + section_rela_eh_frame * elf_section_header_size,
+		names.rela_eh_frame, sht_rela, 0, parts.rela_eh_frame, sizes.rela_eh_frame,
+		section_symtab, section_eh_frame, 8, elf_relocation_size)
+}
+
+fn put_section_header(mut output []u8, at int, name int, kind u32, flags u64, offset int, size int, link u32, info u32, alignment u64, entry_size u64) {
+	put_u32(mut output, at, u32(name))
+	put_u32(mut output, at + 4, kind)
+	put_u64(mut output, at + 8, flags)
+	put_u64(mut output, at + 16, 0) // no address: the linker decides those
+	put_u64(mut output, at + 24, u64(offset))
+	put_u64(mut output, at + 32, u64(size))
+	put_u32(mut output, at + 40, link)
+	put_u32(mut output, at + 44, info)
+	put_u64(mut output, at + 48, alignment)
+	put_u64(mut output, at + 56, entry_size)
+}
+
+// emit_object_header writes the ELF header. A relocatable file has no entry
+// point, no program headers and no segment, so the three fields describing those
+// say nothing, and the field that matters is where the section headers start.
+fn emit_object_header(mut output []u8, machine target.Target, parts PartOffsets) {
+	put(mut output, 0, elf_magic)
+	output[4] = elf_class_64
+	output[5] = elf_data_little_endian
+	output[6] = elf_version_current
+	// Byte 7 is the ABI, System V, and bytes 8 to 15 are its padding: the zeroes
+	// the file was made of are what belongs there, so nothing is written.
+	put_u16(mut output, 16, elf_type_rel)
+	put_u16(mut output, 18, machine.elf_machine)
+	put_u32(mut output, 20, 1) // the container version, which is current
+	put_u64(mut output, 24, 0) // no entry point
+	put_u64(mut output, 32, 0) // no program headers
+	put_u64(mut output, 40, u64(parts.headers))
+	put_u32(mut output, 48, 0) // no architecture-specific flags
+	put_u16(mut output, 52, elf_header_size)
+	put_u16(mut output, 54, 0) // no program header size
+	put_u16(mut output, 56, 0) // no program headers
+	put_u16(mut output, 58, elf_section_header_size)
+	put_u16(mut output, 60, section_count)
+	put_u16(mut output, 62, section_shstrtab)
+}
