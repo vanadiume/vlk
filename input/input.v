@@ -90,7 +90,7 @@ pub fn classify(bytes []u8, path string) !Kind {
 // is the order in which a link that has already sorted its inputs by kind reads
 // them; a caller that needs the command line's own order passes the archives it
 // cares about as paths.
-pub fn read(paths []string, libraries []string, library_dirs []string, machine target.Target) !Read {
+pub fn read(paths []string, libraries []string, library_dirs []string, static_link bool, machine target.Target) !Read {
 	mut out := Read{}
 	mut provided := map[string]bool{}
 	mut needed := map[string]bool{}
@@ -117,13 +117,13 @@ pub fn read(paths []string, libraries []string, library_dirs []string, machine t
 		}
 	}
 	// A `-l` name that resolved to a static archive is read the way a path that
-	// names one is. The search is the dynamic one's, which is the search the
-	// check in `settled` makes over the same names: a pull made by one search
-	// and reported by another would be a link that pulled a member and then
-	// said the name it answers is undefined.
+	// names one is. The search is the one the kind asks for: a static program
+	// resolves a name to the archive even when a shared object of the same name
+	// stands beside it, because it carries the code it calls rather than asking
+	// a loader for it, and the other way round for a dynamic one.
 	if libraries.len > 0 {
 		dirs := library.search_dirs(library_dirs, machine.library_dirs)
-		for found in library.resolve_library_files(libraries, dirs, false)! {
+		for found in library.resolve_library_files(libraries, dirs, static_link)! {
 			if !found.archive {
 				continue
 			}

@@ -334,3 +334,42 @@ fn test_a_library_name_that_resolves_to_an_archive_pulls_its_members() {
 	assert report.libraries.len == 0
 	assert run_image(out) == 9
 }
+
+// A static link resolves a `-l` name to the archive even when a shared object of
+// the same name stands beside it: the kind is what asks for that search, because
+// a static program carries the code it calls rather than asking a loader for it.
+fn test_a_static_link_pulls_the_archive_beside_a_shared_object_of_the_same_name() {
+	machine := host()
+	dir := os.join_path(os.temp_dir(), 'vlk_link_static_${os.getpid()}')
+	os.mkdir_all(dir) or { panic(err) }
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	// The shared object defines something else, so a link that took it would have
+	// nothing to answer `helper` with.
+	mut holder := unit.Program{}
+	holder.text = []u8{len: 8, init: u8(0x90)}
+	holder.defined['other'] = true
+	holder.labels['other'] = 0
+	shared := elf.write(holder, machine, .shared) or { panic('the shared object was not written: ${err.msg()}') }
+	os.write_file_array(os.join_path(dir, 'libnine.so'), shared) or { panic(err) }
+	os.write_file_array(os.join_path(dir, 'libnine.a'), archive_of('nine.o',
+		elf.object(exiting_helper(), machine) or {
+			panic('the object was not written: ${err.msg()}')
+		}, ['helper'])) or { panic(err) }
+	caller_path := scratch('static_caller.o')
+	os.write_file_array(caller_path, elf.object(calling_helper(), machine) or {
+		panic('the object was not written: ${err.msg()}')
+	}) or { panic(err) }
+	out := scratch('static_nine')
+	report := link_files([caller_path], Options{
+		entry:        'main'
+		target:       machine
+		output:       out
+		kind:         .static_program
+		library_dirs: [dir]
+		libraries:    ['nine']
+	}) or { panic('the link failed: ${err.msg()}') }
+	assert report.pulled == 1
+	assert run_image(out) == 9
+}

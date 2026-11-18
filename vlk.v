@@ -371,7 +371,8 @@ pub:
 // paths in, an executable out. A caller that has units already, or wants the
 // image bytes and no file, uses `link` or `merge` instead.
 pub fn link_files(paths []string, options Options) !Report {
-	read := input.read(paths, options.libraries, options.library_dirs, options.target)!
+	read := input.read(paths, options.libraries, options.library_dirs,
+		options.kind == .static_program, options.target)!
 	mut opts := options
 	if read.shared.len > 0 {
 		mut shared := opts.shared_libraries.clone()
