@@ -35,7 +35,8 @@ number moves when a released tag does.
 - `vlk.link`: units in, the bytes of the image out.
 - `vlk.link_files`: paths in, an executable written, and a report of what the
   link took. A `-l` name that resolves to a static archive pulls the members
-  that answer a name nothing defines yet.
+  that answer a name nothing defines yet, and so do the archives a GNU ld script
+  names beside the library it stands for.
 - The suite writes images and runs them: the container's tests run two programs
   and read their exit statuses, and a link of a hand-built unit, an object file
   and an archive member are each executed after they are written.

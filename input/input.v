@@ -117,16 +117,19 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 		}
 	}
 	// A `-l` name that resolved to a static archive is read the way a path that
-	// names one is. The search is the one the kind asks for: a static program
+	// names one is, and so is an archive a GNU ld script names beside its
+	// library. The search is the one the kind asks for: a static program
 	// resolves a name to the archive even when a shared object of the same name
 	// stands beside it, because it carries the code it calls rather than asking
 	// a loader for it, and the other way round for a dynamic one.
+	//
+	// What is read is `archive_libraries`, not the file each name resolved to,
+	// because the two are not the same list: `/usr/lib/libc.so` is a script that
+	// reads `GROUP ( libc.so.6  libc_nonshared.a )`, and `atexit` is in the
+	// archive rather than in the shared object the script names first.
 	if libraries.len > 0 {
 		dirs := library.search_dirs(library_dirs, machine.library_dirs)
-		for found in library.resolve_library_files(libraries, dirs, static_link)! {
-			if !found.archive {
-				continue
-			}
+		for found in library.archive_libraries(libraries, dirs, static_link)! {
 			bytes := os.read_bytes(found.path) or { return error('${found.path}: ${err.msg()}') }
 			parts := archive.read(bytes) or { return error('${found.path}: ${err.msg()}') }
 			members := pull(parts, found.path, machine, mut needed, mut provided)!

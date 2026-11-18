@@ -373,3 +373,64 @@ fn test_a_static_link_pulls_the_archive_beside_a_shared_object_of_the_same_name(
 	assert report.pulled == 1
 	assert run_image(out) == 9
 }
+
+// A `-l` name can resolve to a GNU ld script, and the script names a library and
+// the archives beside it. The archives are where the C library keeps what its
+// shared object does not export, so they are read for the names they answer.
+// The directory written here is libc's own shape: `libnine.so` is a script,
+// `libnine.so.6` is the library the script stands for and defines something
+// else, and `libnine_nonshared.a` is the archive that answers `helper`. The link
+// is given the name and never a path to the archive.
+fn test_a_script_named_by_a_library_pulls_the_archives_it_names() {
+	machine := host()
+	dir := os.join_path(os.temp_dir(), 'vlk_link_script_${os.getpid()}')
+	os.mkdir_all(dir) or { panic(err) }
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	mut holder := unit.Program{}
+	holder.text = []u8{len: 8, init: u8(0x90)}
+	holder.defined['other'] = true
+	holder.labels['other'] = 0
+	shared := elf.write(holder, machine, .shared) or {
+		panic('the shared object was not written: ${err.msg()}')
+	}
+	os.write_file_array(os.join_path(dir, 'libnine.so.6'), shared) or { panic(err) }
+	// The file a `-l` name finds is text and not an object, which is the shape
+	// the search has to read rather than hand to the reader of objects.
+	os.write_file(os.join_path(dir, 'libnine.so'),
+		'/* GNU ld script\nGROUP ( libnine.so.6  libnine_nonshared.a ) */\n') or { panic(err) }
+	os.write_file_array(os.join_path(dir, 'libnine_nonshared.a'), archive_of('nine.o',
+		elf.object(exiting_helper(), machine) or {
+			panic('the object was not written: ${err.msg()}')
+		}, ['helper'])) or { panic(err) }
+	caller_path := scratch('script_caller.o')
+	os.write_file_array(caller_path, elf.object(calling_helper(), machine) or {
+		panic('the object was not written: ${err.msg()}')
+	}) or { panic(err) }
+	out := scratch('script_nine')
+	report := link_files([caller_path], Options{
+		entry:        'main'
+		target:       machine
+		output:       out
+		library_dirs: [dir]
+		libraries:    ['nine']
+	}) or { panic('the link failed: ${err.msg()}') }
+	assert report.pulled == 1
+	// The script was followed to the library it names, and that is the name the
+	// loader is asked for. Only the archive is merged: the library is mapped.
+	assert 'libnine.so.6' in report.libraries
+	// The image names a library that sits in a scratch directory, and the loader
+	// searches its own directories rather than the ones this link read. The
+	// variable is what tells it where the file is, and it is put back because
+	// the rest of the suite runs in this process too.
+	previous := os.getenv_opt('LD_LIBRARY_PATH')
+	os.setenv('LD_LIBRARY_PATH', dir, true)
+	status := run_image(out)
+	if old := previous {
+		os.setenv('LD_LIBRARY_PATH', old, true)
+	} else {
+		os.unsetenv('LD_LIBRARY_PATH')
+	}
+	assert status == 9
+}

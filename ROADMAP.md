@@ -33,11 +33,6 @@ Left:
   move, checked across vcc's corpora, with the programs run.
 - Link time for vcc's V self-build measured against lld, with the numbers in the
   README.
-- A `-l` name that resolves to a GNU ld script still contributes only the library
-  the script names. `library.archive_libraries` answers the archives a script
-  names beside it, `libc_nonshared.a` in the C library's own script among them,
-  and no member of one is pulled: that list is read by nothing, so a name only
-  such an archive defines still comes back as an undefined reference.
 
 ## 0.2.0: a linker another tree can use
 
