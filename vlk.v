@@ -1,6 +1,9 @@
 module vlk
 
+import input
 import library
+import os
+import output
 import place
 import reloc
 import symbols
@@ -29,19 +32,21 @@ pub type Target = target.Target
 // Options is what a caller asks a link for. The zero value is a link of what the
 // units say, with the entry the caller names and no library named by the caller.
 // One struct serves all three depths: a field the depth a caller chose does not
-// read is a field it does not have to fill.
+// read is a field it does not have to fill. The fields are mutable because the
+// high entries fill in what they resolved, and a caller's struct is a value it
+// owns rather than one the library keeps.
 pub struct Options {
-pub:
+pub mut:
 	// entry is the name of the function the process stub calls. A link none of
 	// whose units defines it is refused, and that refusal is the only thing this
 	// field is used for.
 	entry string
 	// target is the machine and system the link is for.
 	target Target
-	// libraries are the names the image records as shared libraries it needs, in
-	// order, already resolved: the caller turned `-lm` into the name the loader
-	// knows and passes that. Resolving a name to a file is the caller's work
-	// because the file is read by the caller's system, not by this library.
+	// libraries are the `-l` names the command line gave, in order and as they
+	// were written: `c` for `-lc`. Resolving one to a file is this library's
+	// search, because the high entries are what read the file and the image
+	// records the name the loader knows rather than the name it was asked for.
 	libraries []string
 	// library_dirs are the `-L` directories the command line gave, in order.
 	library_dirs []string
@@ -55,6 +60,15 @@ pub:
 	// and no runtime archive. An import nothing in the link answers is then left
 	// to the loader instead of being refused.
 	no_default_libraries bool
+	// output is the path the image is written to, for the high entries. Empty
+	// means the caller wants the bytes and no file.
+	output string
+	// kind is which of the container's three shapes the image takes: a dynamic
+	// program, a static program, or a shared object.
+	kind output.Kind
+	// container is what the caller asks the container for beyond the kind: an
+	// executable stack, eager binding, a read-only relocation segment, a soname.
+	container output.Options
 }
 
 // Merged is one merge's answer: the single program the units became, and the
@@ -315,16 +329,102 @@ pub fn merge(units []unit.Program, options Options) !Merged {
 	}
 }
 
-// link is the whole of one link: the merge, the check that a library answers
-// every name the image leaves to the loader, and the bytes of the image.
+// link is the whole of one link from units: the merge, the check that a library
+// answers every name the image leaves to the loader, and the bytes of the image.
 //
-// It is not here yet. The merge is, so a caller that can answer the library
-// question itself uses `merge` today; `link` refuses rather than answer with a
-// program nothing has checked.
-pub fn link(units []unit.Program, options Options) !unit.Program {
-	_ = units
-	_ = options
-	return error('vlk cannot write an image yet: the merge is here and the container is still in vcc')
+// It answers with the bytes rather than writing them, so a caller that has a
+// place of its own for an image keeps them. `link_files` is the same link for a
+// caller that has paths.
+pub fn link(units []unit.Program, options Options) ![]u8 {
+	merged := merge(units, options)!
+	program := settled(merged, options)!
+	return output.image(program, options.target, options.kind, options.container)
+}
+
+// Report is what a link of paths came to.
+pub struct Report {
+pub:
+	// path is the file the image was written to, empty when the caller asked
+	// for no file.
+	path string
+	// bytes is how long the image is.
+	bytes int
+	// units is how many inputs the merge took, and pulled is how many of them
+	// came out of an archive rather than from a path of their own.
+	units  int
+	pulled int
+	// libraries are the names the image records as needed, in order.
+	libraries []string
+}
+
+// link_files is the whole of one link from the paths of its inputs: each file is
+// read as a relocatable object, an archive or a shared object, the merge runs on
+// what comes out, and the image is written to `Options.output` when that names a
+// file.
+//
+// This is the entry for a caller that does not want to drive a linker: one call,
+// paths in, an executable out. A caller that has units already, or wants the
+// image bytes and no file, uses `link` or `merge` instead.
+pub fn link_files(paths []string, options Options) !Report {
+	read := input.read(paths, options.target)!
+	mut opts := options
+	if read.shared.len > 0 {
+		mut shared := opts.shared_libraries.clone()
+		shared << read.shared
+		opts.shared_libraries = shared
+	}
+	merged := merge(read.units, opts)!
+	program := settled(merged, opts)!
+	bytes := output.image(program, opts.target, opts.kind, opts.container)!
+	if opts.output != '' {
+		os.write_file_array(opts.output, bytes) or {
+			return error('${opts.output}: ${err.msg()}')
+		}
+		// An image something starts gets the execute bit; a shared object is
+		// mapped rather than started, so it keeps the mode the write gave it.
+		if opts.kind != .shared {
+			info := os.stat(opts.output) or { return error('${opts.output}: ${err.msg()}') }
+			if (info.mode & os.s_ifmt) == os.s_ifreg && (info.mode & os.s_ixusr) == 0 {
+				os.chmod(opts.output, 0o755) or {
+					return error('${opts.output}: ${err.msg()}')
+				}
+			}
+		}
+	}
+	return Report{
+		path:      opts.output
+		bytes:     bytes.len
+		units:     read.units.len
+		pulled:    read.pulled
+		libraries: program.libraries
+	}
+}
+
+// settled is the merge's answer made ready to wrap. The names the image leaves to
+// the loader are asked of the libraries the caller named, and `-l` names are
+// resolved to what the loader knows so the image can record them: `-lm` is
+// `libm.so.6` in the image and `/usr/lib/libm.so` on this machine, and the two
+// are different strings for one library.
+fn settled(merged Merged, options Options) !unit.Program {
+	dirs := library.search_dirs(options.library_dirs, options.target.library_dirs)
+	// A link with no default libraries names no C library in its image, so that
+	// library answers nothing for its imports: a name only it defines is as
+	// unresolved as any other, and the loader would fail on it.
+	base := if options.no_default_libraries { '' } else { options.target.base_library }
+	unresolved := library.unresolved_imports_including_files(merged.required,
+		options.libraries, options.shared_libraries, dirs, base)
+	if unresolved.len > 0 {
+		return error('undefined reference to `${unresolved[0]}`: no library the image names defines it')
+	}
+	sonames := library.resolve_libraries(options.libraries, dirs,
+		options.kind == .static_program)!
+	mut program := merged.program
+	for soname in sonames {
+		if soname !in program.libraries {
+			program.libraries << soname
+		}
+	}
+	return program
 }
 
 // merge_text builds the merged text at its final length and copies each unit in
