@@ -1,10 +1,10 @@
 module vlk
 
-import elf
-import library
+import vanadiume.vlk.elf
+import vanadiume.vlk.library
 import os
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The high entries, checked the only way that settles anything: an image is
 // written, the kernel is handed it, and the status it leaves with is read back.

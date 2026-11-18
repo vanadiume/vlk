@@ -1,6 +1,6 @@
 module vlk
 
-import unit
+import vanadiume.vlk.unit
 
 // The three depths answer the same request at different stages, so the refusals
 // worth pinning are the ones a caller meets before anything is read or written.

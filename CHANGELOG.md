@@ -42,3 +42,14 @@ number moves when a released tag does.
   and an archive member are each executed after they are written.
 - No garbage collector: the library is built the way its consumers are, and the
   gate runs the suite under `-gc none` as well as the default.
+
+### Changed
+
+- A module imports its siblings by the published path (`import
+  vanadiume.vlk.unit`) rather than by the bare module name. A bare import is
+  resolved by its last segment against every module in the build, so a consumer
+  that already holds a module called `unit`, `symbols` or `reloc` had its own
+  module called in place of this one's and the library failed to compile inside
+  that consumer. The checkout now has to be reachable at
+  `~/.vmodules/vanadiume/vlk`, which the README says how to arrange.
+

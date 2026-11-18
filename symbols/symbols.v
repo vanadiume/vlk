@@ -1,6 +1,6 @@
 module symbols
 
-import unit
+import vanadiume.vlk.unit
 
 // The names of one link: the union of the units' symbol tables, with the
 // definitions resolved to the one unit each name binds to.

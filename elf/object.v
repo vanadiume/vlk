@@ -1,7 +1,7 @@
 module elf
 
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The relocatable container: what `-c` writes, and what a linker reads back.
 //

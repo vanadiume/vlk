@@ -1,7 +1,7 @@
 module reloc
 
-import unit
-import symbols
+import vanadiume.vlk.unit
+import vanadiume.vlk.symbols
 
 // Rewriting one unit's references for the merged unit. A unit wrote every
 // reference as an offset inside the one blob it was building, so the merge moves

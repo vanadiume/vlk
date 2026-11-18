@@ -1,7 +1,7 @@
 module elf
 
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The relocatable container is checked against a program built by hand rather
 // than one the emitter produced, because the properties worth pinning are ones

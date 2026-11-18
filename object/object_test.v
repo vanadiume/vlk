@@ -1,8 +1,8 @@
 module object
 
-import elf
-import target
-import unit
+import vanadiume.vlk.elf
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The reader is checked against the tree's own writer: a program built here is
 // written with `backend.os.elf.object`, read back with `read`, and the two are

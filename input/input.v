@@ -1,11 +1,11 @@
 module input
 
-import archive
-import library
-import object
+import vanadiume.vlk.archive
+import vanadiume.vlk.library
+import vanadiume.vlk.object
 import os
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // What a link's inputs are, read into the shape the merge takes. A path is one of
 // three files: a relocatable object, which becomes a unit; an `ar` archive, which

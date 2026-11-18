@@ -1,7 +1,7 @@
 module elf
 
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The ELF64 container, in the shapes Linux starts and its dynamic loader
 // finishes. A program that calls a shared library is not a header and a code

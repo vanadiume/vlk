@@ -1,7 +1,7 @@
 module object
 
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The reader for a relocatable object: an ELF64 ET_REL file in, the one unit
 // the in-house linker merges out.

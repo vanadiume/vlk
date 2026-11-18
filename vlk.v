@@ -1,14 +1,14 @@
 module vlk
 
-import input
-import library
+import vanadiume.vlk.input
+import vanadiume.vlk.library
 import os
-import output
-import place
-import reloc
-import symbols
-import target
-import unit
+import vanadiume.vlk.output
+import vanadiume.vlk.place
+import vanadiume.vlk.reloc
+import vanadiume.vlk.symbols
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // vlk is a linker library. The inputs of one link go in, the single program that
 // link produces comes out, and the bytes of that program are written by `output`

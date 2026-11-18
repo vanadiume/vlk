@@ -78,9 +78,11 @@ with a layout or a reference policy of its own: `symbols.collect`,
 `place.lay` and `reloc`.
 
 The import path is the name the package is published under; the identifiers a
-program writes are the module names, `vlk` and `unit`. A checkout linked into
-`~/.vmodules/vlk` rather than installed through the registry is imported as
-plain `vlk` and `vlk.unit`, which is what a program in this tree uses.
+program writes are the module names, `vlk` and `unit`. A checkout is imported
+as `vanadiume.vlk` and its modules as `vanadiume.vlk.unit`, and the tree's own
+files write that path too. A bare `import unit` is resolved by its last segment
+against every module in the build, so a consumer that already holds a module of
+that name would have its own module called instead of this one's.
 
 ## Building and testing
 
@@ -110,10 +112,12 @@ repository is https://github.com/vanadiume/vlk. `v install vanadiume/vlk` is not
 the same name and the registry answers that it does not exist.
 
 To work on the library against a consumer in the same checkout, install it as a
-link rather than a copy:
+link rather than a copy. The library's own files import their modules by the
+published path, so a checkout has to be reachable there to build at all:
 
 ```sh
-ln -sfn ~/vanadium/vlk ~/.vmodules/vlk
+mkdir -p ~/.vmodules/vanadiume
+ln -sfn ~/vanadium/vlk ~/.vmodules/vanadiume/vlk
 ```
 
 ## Related

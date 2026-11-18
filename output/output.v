@@ -1,8 +1,8 @@
 module output
 
-import elf
-import target
-import unit
+import vanadiume.vlk.elf
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // Wrapping a merged program as the bytes of an output file. It is a seam and
 // deliberately thin: the container in `elf/` writes the shape the kind asks for,

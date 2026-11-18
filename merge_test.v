@@ -1,8 +1,8 @@
 module vlk
 
-import symbols
-import target
-import unit
+import vanadiume.vlk.symbols
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 
 // The merge is checked on programs built here rather than on the output of
 // codegen, because the questions worth pinning are about the merge's own rules:

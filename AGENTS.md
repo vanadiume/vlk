@@ -18,9 +18,12 @@ and the command line tool that drives the library is a separate project (VVD).
 It is published to vpm with a `v.mod` at the root, so the module layout is not
 free: `vlk` at the root, one directory per submodule, each declaring the
 directory's own name. The registry entry is `vanadiume.vlk`, which installs under
-`~/.vmodules/vanadiume/vlk` and is imported as `vanadiume.vlk`; the tree's own
-imports are the flat ones (`import unit`), and a program in this tree writes
-`vlk.link` because the module is the root of the package.
+`~/.vmodules/vanadiume/vlk` and is imported as `vanadiume.vlk`. Every file here
+imports its modules by that path (`import vanadiume.vlk.unit`), because a bare
+`import unit` is resolved by its last segment against every module in the build
+and a consumer that already holds a module of that name would have its own
+called instead. The checkout therefore has to be reachable at
+`~/.vmodules/vanadiume/vlk`, which the README says how to arrange.
 
 ## The three constraints
 

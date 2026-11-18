@@ -1,6 +1,6 @@
 module place
 
-import unit
+import vanadiume.vlk.unit
 
 // Where each unit lands in the merged program. One link concatenates three kinds
 // of data, and an offset a unit carries is measured from the start of its own

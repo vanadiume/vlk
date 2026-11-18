@@ -1,7 +1,7 @@
 module elf
 
-import target
-import unit
+import vanadiume.vlk.target
+import vanadiume.vlk.unit
 import os
 
 // exit_sequence and exit_sequence_from are the two programs a test runs to see
