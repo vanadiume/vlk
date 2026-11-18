@@ -11,14 +11,17 @@ module target
 pub fn host() ?Target {
 	$if amd64 && linux {
 		return Target{
-			name:         'x86_64-linux'
-			word_size:    8
-			elf_machine:  62 // EM_X86_64
-			page_size:    0x1000
-			load_base:    0x400000
-			interpreter:  '/lib64/ld-linux-x86-64.so.2'
-			base_library: 'libc.so.6'
-			library_dirs: ['/usr/local/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib', '/lib']
+			name:            'x86_64-linux'
+			word_size:       8
+			elf_machine:     62 // EM_X86_64
+			page_size:       0x1000
+			load_base:       0x400000
+			interpreter:     '/lib64/ld-linux-x86-64.so.2'
+			base_library:    'libc.so.6'
+			library_dirs:    ['/usr/local/lib', '/usr/lib/x86_64-linux-gnu', '/usr/lib', '/lib']
+			registers:       registers()
+			float_registers: float_registers()
+			encoders:        encoders()
 		}
 	} $else {
 		return none

@@ -34,4 +34,14 @@ pub:
 	// search order. The directories the command line added are Options.library_dirs
 	// and are searched before these.
 	library_dirs []string
+	// registers and float_registers are the machine's two register files. A
+	// container reads a register's spelling in one of them to learn the number an
+	// instruction encoding uses, and the tables are the machine's rather than the
+	// linker's, so a second machine fills its own.
+	registers       []Register
+	float_registers []Register
+	// encoders are the instructions a container writes: the stub it makes for a
+	// library call, and the replacement it puts over a reference the code left as
+	// a field. `check_encoders` says which ones a target is missing.
+	encoders Encoders
 }
