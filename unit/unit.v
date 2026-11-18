@@ -276,9 +276,8 @@ pub mut:
 	libraries []string
 	// no_default_libraries says the image runs against no default libraries:
 	// the container names no C library for it, which is what -nostdlib and
-	// -nodefaultlibs ask a link for. An import the command line's own libraries
-	// do not answer is then left to the loader, and a link asked for with those
-	// flags is a link that asked for that.
+	// -nodefaultlibs ask a link for. The C library then answers no name, so a
+	// link carrying an import only it defines has nothing to answer it.
 	no_default_libraries bool
 	// string_blob is the read-only data: every distinct string literal with the
 	// terminator a library function reads to, and strings is where each one

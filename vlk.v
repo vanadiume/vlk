@@ -57,8 +57,10 @@ pub mut:
 	// asked for, which the image records the way it records a -l name.
 	shared_libraries []library.Library
 	// no_default_libraries says the link names no default library: no C library
-	// and no runtime archive. An import nothing in the link answers is then left
-	// to the loader instead of being refused.
+	// and no runtime archive. The base library then answers nothing, so a name
+	// only it defines is as unresolved as any other, and the check that refuses
+	// an unresolved name refuses that one too. -nostdlib and -nodefaultlibs are
+	// the two flags that ask for it.
 	no_default_libraries bool
 	// output is the path the image is written to, for the high entries. Empty
 	// means the caller wants the bytes and no file.
