@@ -24,11 +24,15 @@ Done:
   read into units.
 - `vlk.merge`, `vlk.link` and `vlk.link_files`: the three depths a caller
   picks from.
+- `elf.Kind.pie`: a position-independent executable whose addresses are offsets,
+  with `PT_PHDR`, `DF_1_PIE`, and the relative relocations a loader applies.
 
 Left:
 
 - vcc builds `vlk.Options` and calls `vlk.link`, its `codegen/` imports `unit`,
   and its `linking/` and `image/` directories are gone.
+- vcc's `vlk_kind` gains the `.pie` arm and `-fPIE`/`-fpie` stop being ignored,
+  so a C link can ask for the kind this library writes.
 - Images byte for byte identical to the ones vcc's own linker wrote before the
   move, checked across vcc's corpora, with the programs run.
 - Link time for vcc's V self-build measured against lld, with the numbers in the
@@ -43,6 +47,13 @@ Left:
 - Errors that name the input file, the symbol, and the two places that disagree,
   because that is what a link failure is about.
 - Response files and the part of a linker script that says where a section goes.
+- Absolute references in a pie or a shared object: a pie link refuses a named
+  one today, and a shared link still writes the field as an offset with no
+  relocation that adds the base. Supporting both means counting those fields
+  into the relative run and writing an `R_X86_64_RELATIVE` entry for each, with
+  undefined weak names left as zero.
+- A test for a pie's `PT_GNU_RELRO` segment, which the writer emits and only a
+  program's segment pins today.
 
 ## Later
 
