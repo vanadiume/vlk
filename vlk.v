@@ -56,6 +56,11 @@ pub mut:
 	// defines, which answer the image's imports, and the name the loader is
 	// asked for, which the image records the way it records a -l name.
 	shared_libraries []library.Library
+	// groups are the runs of inputs a command line wrapped in --start-group and
+	// --end-group, in order. Every archive in a group is swept until a whole pass
+	// pulls no member, which is what lets two libraries answer each other's
+	// names; the inputs outside a group keep the one pass they have always had.
+	groups []input.Group
 	// no_default_libraries says the link names no default library: no C library
 	// and no runtime archive. The base library then answers nothing, so a name
 	// only it defines is as unresolved as any other, and the check that refuses
@@ -374,7 +379,7 @@ pub:
 // image bytes and no file, uses `link` or `merge` instead.
 pub fn link_files(paths []string, options Options) !Report {
 	read := input.read(paths, options.libraries, options.library_dirs,
-		options.kind == .static_program, options.target)!
+		options.kind == .static_program, options.groups, options.target)!
 	mut opts := options
 	if read.shared.len > 0 {
 		mut shared := opts.shared_libraries.clone()

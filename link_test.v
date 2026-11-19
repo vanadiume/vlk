@@ -1,6 +1,7 @@
 module vlk
 
 import vanadiume.vlk.elf
+import vanadiume.vlk.input
 import vanadiume.vlk.library
 import os
 import vanadiume.vlk.target
@@ -243,6 +244,95 @@ fn exiting_helper() unit.Program {
 	helper.defined['helper'] = true
 	helper.labels['helper'] = 0
 	return helper
+}
+
+// calling_a_from_b defines `b`, calls `a`, and then stops with 9 if the call
+// ever returned. The call is a fixup, so `a` is an import the link has to answer.
+fn calling_a_from_b() unit.Program {
+	mut b := unit.Program{}
+	b.text = [u8(0xbf), u8(9), u8(0), u8(0), u8(0), u8(0xe8), u8(0), u8(0), u8(0), u8(0), u8(0xb8),
+		u8(60), u8(0), u8(0), u8(0), u8(0x0f), u8(0x05)]
+	b.defined['b'] = true
+	b.labels['b'] = 0
+	b.imports << 'a'
+	b.fixups << unit.Fixup{
+		start:  6
+		length: 4
+		kind:   .call_import
+		name:   'a'
+	}
+	return b
+}
+
+// exiting_a defines `a` and stops with 7, so an image that leaves with 7 says
+// the member of the first archive ran.
+fn exiting_a() unit.Program {
+	mut a := unit.Program{}
+	a.text = [u8(0xbf), u8(7), u8(0), u8(0), u8(0), u8(0xb8), u8(60), u8(0), u8(0), u8(0), u8(0x0f),
+		u8(0x05)]
+	a.defined['a'] = true
+	a.labels['a'] = 0
+	return a
+}
+
+// calling_b is the program: it calls `b` and then stops with 0.
+fn calling_b() unit.Program {
+	mut main_unit := unit.Program{}
+	main_unit.text = [u8(0xe8), u8(0), u8(0), u8(0), u8(0), u8(0xbf), u8(0), u8(0), u8(0), u8(0),
+		u8(0xb8), u8(60), u8(0), u8(0), u8(0), u8(0x0f), u8(0x05)]
+	main_unit.defined['main'] = true
+	main_unit.labels['main'] = 0
+	main_unit.imports << 'b'
+	main_unit.fixups << unit.Fixup{
+		start:  1
+		length: 4
+		kind:   .call_import
+		name:   'b'
+	}
+	return main_unit
+}
+
+// A group is two or more archives swept together. The program needs `b`, the
+// archive that holds it sits after the archive that holds `a`, and `b` needs
+// `a`: read once each in order, the earlier archive is passed before the name it
+// could answer exists. Inside the markers the sweep comes back for it.
+fn test_a_group_lets_an_earlier_archive_answer_a_later_member() {
+	machine := host()
+	caller_path := scratch('group_caller.o')
+	os.write_file_array(caller_path, elf.object(calling_b(), machine) or { panic(err) }) or {
+		panic(err)
+	}
+	a_path := scratch('liba.a')
+	os.write_file_array(a_path, archive_of('a.o', elf.object(exiting_a(), machine) or {
+		panic(err)
+	}, ['a'])) or { panic(err) }
+	b_path := scratch('libb.a')
+	os.write_file_array(b_path, archive_of('b.o', elf.object(calling_a_from_b(), machine) or {
+		panic(err)
+	}, ['b'])) or { panic(err) }
+	// The same three paths with no markers: the archive that holds `a` is read
+	// before anything needs `a`, so the name stays unanswered.
+	if _ := link_files([caller_path, a_path, b_path], Options{
+		entry:  'main'
+		target: machine
+		output: scratch('grouped_ungrouped')
+	}) {
+		assert false, 'the link answered a name the earlier archive was passed over for'
+	} else {
+		assert err.msg().contains('undefined reference')
+		assert err.msg().contains('`a`')
+	}
+	out := scratch('grouped')
+	report := link_files([caller_path], Options{
+		entry:  'main'
+		target: machine
+		groups: [input.Group{
+			paths: [a_path, b_path]
+		}]
+		output: out
+	}) or { panic('the grouped link failed: ${err.msg()}') }
+	assert report.pulled == 2
+	assert run_image(out) == 7
 }
 
 fn test_an_archive_member_answers_an_import() {
