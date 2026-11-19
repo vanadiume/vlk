@@ -26,6 +26,10 @@ Done:
   picks from.
 - `elf.Kind.pie`: a position-independent executable whose addresses are offsets,
   with `PT_PHDR`, `DF_1_PIE`, and the relative relocations a loader applies.
+- A field that holds a symbol's absolute address, in a pie or a shared object, is
+  written as the symbol's place in the image beside an `R_X86_64_RELATIVE` entry,
+  with an undefined weak name left as zero and a four-byte field refused by name.
+  An entry over the code sets `DF_TEXTREL`.
 
 Left:
 
@@ -47,13 +51,6 @@ Left:
 - Errors that name the input file, the symbol, and the two places that disagree,
   because that is what a link failure is about.
 - Response files and the part of a linker script that says where a section goes.
-- Absolute references in a pie or a shared object: a pie link refuses a named
-  one today, and a shared link still writes the field as an offset with no
-  relocation that adds the base. Supporting both means counting those fields
-  into the relative run and writing an `R_X86_64_RELATIVE` entry for each, with
-  undefined weak names left as zero.
-- A test for a pie's `PT_GNU_RELRO` segment, which the writer emits and only a
-  program's segment pins today.
 
 ## Later
 
