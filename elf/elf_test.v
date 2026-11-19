@@ -377,6 +377,18 @@ fn se_phdr_of(bytes []u8, kind u32) int {
 	return -1
 }
 
+// se_phdr_count is how many headers of one kind the image carries, which is what
+// says whether a promise is stated once or twice.
+fn se_phdr_count(bytes []u8, kind u32) int {
+	mut count := 0
+	for i in 0 .. int(se16(bytes, 56)) {
+		if se32(bytes, se_phdr_at(bytes, i)) == kind {
+			count++
+		}
+	}
+	return count
+}
+
 // se_dynamic_has says whether the dynamic table names a tag at all, which is
 // how a test tells an entry that is absent from one whose value is zero.
 fn se_dynamic_has(bytes []u8, tag u64) bool {
@@ -1064,6 +1076,69 @@ fn test_a_pie_runs_where_its_loader_puts_it() {
 	assert relative.addend == i64(se64(bytes, 24) + 12)
 	assert se64(bytes, int(relative.offset)) == u64(relative.addend)
 	path := os.join_path(os.temp_dir(), 'vlk_elf_pie_${os.getpid()}')
+	os.write_file_array(path, bytes) or { panic(err) }
+	os.chmod(path, 0o755) or { panic(err) }
+	result := os.exec([path])
+	os.rm(path) or {}
+	assert result.exit_code == 42
+}
+
+// -Wl,-z,relro over a pie covers the table the loader fills in, the relocations it
+// applies and the dynamic table it reads, which is the range a program's segment
+// covers, and the start is page aligned for the same reason: the loader rounds it
+// down before it calls mprotect, and a start inside a page the image's own data
+// lives in would make that data read-only. The range is checked against the slot
+// the bound name's relative entry fills as well as against the dynamic table, and
+// the image is run, which is what proves the loader wrote the slot before the
+// protection went up.
+fn test_a_pie_writes_a_relro_segment_over_its_loader_tables() {
+	machine := se_target()
+	code := pie_sequence(42) or { panic('the sequence was not built: ${err.msg()}') }
+	mut program := unit.Program{}
+	program.text = code
+	program.entry_place = 0
+	program.labels['target'] = 12
+	program.imports << 'target'
+	program.bound['target'] = unit.Definition{
+		offset:   12
+		function: true
+	}
+	program.fixups << unit.Fixup{
+		start:    0
+		length:   7
+		kind:     .got_address
+		name:     'target'
+		register: 'rax'
+	}
+	bytes := write_options(program, machine, .pie, Options{
+		relro: true
+	}) or { panic('the pie was not written: ${err.msg()}') }
+	// One segment: a second header over the same range would be two statements of
+	// one promise.
+	assert se_phdr_count(bytes, elf_ph_type_gnu_relro) == 1
+	at := se_phdr_of(bytes, elf_ph_type_gnu_relro)
+	start := se64(bytes, at + 8)
+	size := se64(bytes, at + 32)
+	assert size > 0
+	assert start % machine.page_size == 0
+	// The image's base is zero, so the address the header names is the offset.
+	assert se64(bytes, at + 16) == start
+	assert se64(bytes, at + 24) == start
+	// The range covers the slot the loader fills and the table it reads.
+	tables := se_tables(bytes, 0)
+	slot := se_relative_relocation(bytes, tables).offset
+	assert slot >= start
+	assert slot + 8 <= start + size
+	dynamic := u64(se_dynamic_offset(bytes))
+	assert start <= dynamic
+	assert start + size >= dynamic + u64(se_dynamic_size(bytes))
+	// Without the option there is no segment and one header fewer.
+	plain := write(program, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	assert se_phdr_count(plain, elf_ph_type_gnu_relro) == 0
+	assert se16(bytes, 56) == se16(plain, 56) + 1
+	path := os.join_path(os.temp_dir(), 'vlk_elf_pie_relro_${os.getpid()}')
 	os.write_file_array(path, bytes) or { panic(err) }
 	os.chmod(path, 0o755) or { panic(err) }
 	result := os.exec([path])
