@@ -30,13 +30,13 @@ Done:
   written as the symbol's place in the image beside an `R_X86_64_RELATIVE` entry,
   with an undefined weak name left as zero and a four-byte field refused by name.
   An entry over the code sets `DF_TEXTREL`.
+- vcc's `-pie`/`-fPIE` and vvd's `-pie` ask for this kind, and both trees run
+  the image at the base the loader chose.
 
 Left:
 
 - vcc builds `vlk.Options` and calls `vlk.link`, its `codegen/` imports `unit`,
   and its `linking/` and `image/` directories are gone.
-- vcc's `vlk_kind` gains the `.pie` arm and `-fPIE`/`-fpie` stop being ignored,
-  so a C link can ask for the kind this library writes.
 - Images byte for byte identical to the ones vcc's own linker wrote before the
   move, checked across vcc's corpora, with the programs run.
 - Link time for vcc's V self-build measured against lld, with the numbers in the
