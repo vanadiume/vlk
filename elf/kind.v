@@ -19,6 +19,15 @@ pub enum Kind {
 	pie
 }
 
+// placed_by_the_loader is whether the kind's base is the loader's to choose
+// rather than the link's. A shared object and a position-independent executable
+// are the two that are mapped where their loader likes, so they are the two whose
+// addresses travel as offsets beside a relative relocation; a program, static or
+// dynamic, is written at the target's load base and has no such entry.
+fn placed_by_the_loader(kind Kind) bool {
+	return kind == .shared || kind == .pie
+}
+
 // Options is what the caller asks the container for beyond the kind. Each one is
 // a promise the image records rather than a change to what the link decided: an
 // image names one of these facts in a program header or a dynamic table entry,
