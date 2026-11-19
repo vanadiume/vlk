@@ -129,6 +129,51 @@ fn test_a_pie_link_calls_a_library_function() {
 	assert run_image(path) == 5
 }
 
+// A pointer in the writable data is a field the link settles, and an image a
+// loader places settles it as an offset beside a relative entry: the loader adds
+// the base it mapped the image at. The field here is written the way an object
+// writes one, as a wide absolute relocation against a name the link defines, and
+// the code reads it and calls what it holds. The exit status is the answer: a
+// field left as a bare offset would call the first page of the address space.
+fn test_a_pie_link_relocates_a_pointer_in_its_data() {
+	mut part := unit.Program{}
+	part.text = [u8(0x48), u8(0x8d), u8(0x05), u8(0), u8(0), u8(0), u8(0), // lea rax, [rip + held]
+	u8(0x48), u8(0x8b), u8(0x00), // mov rax, [rax]
+	u8(0xff), u8(0xd0), // call rax
+	u8(0xbf), u8(21), u8(0), u8(0), u8(0), u8(0xb8), u8(60), u8(0), u8(0), u8(0), u8(0x0f), u8(0x05)]
+	part.globals_blob = []u8{len: 8, init: u8(0)}
+	part.globals['held'] = unit.GlobalSlot{
+		offset: 0
+		width:  8
+	}
+	part.defined['main'] = true
+	part.labels['main'] = 0
+	part.defined['stop'] = true
+	part.labels['stop'] = 12
+	part.relocations << unit.Relocation{
+		offset: 0
+		place:  .data
+		kind:   .absolute
+		name:   'stop'
+		width:  .wide
+	}
+	part.fixups << unit.Fixup{
+		start:    0
+		length:   7
+		kind:     .global_address
+		name:     'held'
+		register: 'rax'
+	}
+	bytes := link([part], Options{
+		entry:  'main'
+		target: host()
+		kind:   .pie
+	}) or { panic('the link failed: ${err.msg()}') }
+	path := scratch('pie_data')
+	os.write_file_array(path, bytes) or { panic(err) }
+	assert run_image(path) == 21
+}
+
 fn test_link_files_reads_an_object_and_writes_a_runnable_image() {
 	machine := host()
 	object_bytes := elf.object(exiting(7), machine) or {
