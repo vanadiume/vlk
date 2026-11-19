@@ -1,18 +1,22 @@
 module elf
 
-// Kind is which link a caller asked for. The three differ in what the container
-// writes and in nothing else, so they are one value with three cases rather than
-// three ways to build an image.
+// Kind is which link a caller asked for. The four differ in what the container
+// writes and in nothing else, so they are one value with four cases rather than
+// four ways to build an image.
 //
 // A program is the dynamic one: the kernel hands it to the loader in
-// `Target.interpreter`. A static program names no loader and resolves every
-// library into itself, and a shared object is a file another program loads
-// rather than one the kernel starts, so it has no entry point and no loader
-// either.
+// `Target.interpreter`, and it runs at the load base the image was written for.
+// A position-independent executable is the same thing placed by its loader: the
+// kernel still hands it over, and every address inside it travels as an offset
+// beside a relocation that adds wherever the kernel put it. A static program
+// names no loader and resolves every library into itself, and a shared object is
+// a file another program loads rather than one the kernel starts, so it has no
+// entry point and no loader either.
 pub enum Kind {
 	program
 	static_program
 	shared
+	pie
 }
 
 // Options is what the caller asks the container for beyond the kind. Each one is

@@ -33,6 +33,13 @@ number moves when a released tag does.
 - `input/`: the paths of a link, read into units, with an archive's members
   pulled for the names nothing defines yet.
 - `vlk.link`: units in, the bytes of the image out.
+- A position-independent executable: `elf.Kind.pie` names an image the kernel maps
+  at a base it chooses, so the link adds no load base to anything and every
+  address that points into the image travels as an offset beside an
+  R_X86_64_RELATIVE entry. The image names its interpreter, writes PT_PHDR so the
+  loader learns where it was mapped, has a real entry point, records DF_1_PIE, and
+  refuses a link that needs a copy relocation or writes a symbol's absolute
+  address into a field, naming what it could not place.
 - `vlk.link_files`: paths in, an executable written, and a report of what the
   link took. A `-l` name that resolves to a static archive pulls the members
   that answer a name nothing defines yet, and so do the archives a GNU ld script
