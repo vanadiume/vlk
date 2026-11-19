@@ -39,6 +39,16 @@ fn run_image(path string) int {
 	return result.exit_code
 }
 
+// le64 reads an eight-byte little-endian field, which is how the ELF header holds
+// the two facts a position-independent link is checked against here.
+fn le64(bytes []u8, at int) u64 {
+	mut value := u64(0)
+	for shift in [0, 8, 16, 24, 32, 40, 48, 56] {
+		value |= u64(bytes[at + shift / 8]) << shift
+	}
+	return value
+}
+
 fn test_a_link_of_one_unit_answers_bytes_that_run() {
 	bytes := link([exiting(42)], Options{
 		entry:  'main'
@@ -47,6 +57,76 @@ fn test_a_link_of_one_unit_answers_bytes_that_run() {
 	path := scratch('one')
 	os.write_file_array(path, bytes) or { panic(err) }
 	assert run_image(path) == 42
+}
+
+// A position-independent link is the shared object's container with an entry
+// point: the kernel maps it wherever it likes and the loader adds that base to
+// every address in the image. The unit here reaches its own code through the
+// global offset table, so the status it leaves is the one it was asked for only
+// if the loader relocated that slot. The bytes are checked for the header facts
+// the kind is, and the image is run, because a header that reads correctly and a
+// program that does not run is the failure this file exists to catch.
+fn test_a_pie_link_is_dynamic_and_runs_where_the_kernel_put_it() {
+	mut part := unit.Program{}
+	part.text = [u8(0x48), u8(0x8d), u8(0x05), u8(0), u8(0), u8(0), u8(0), u8(0x48), u8(0x8b),
+		u8(0x00), u8(0xff), u8(0xd0), u8(0xbf), u8(33), u8(0), u8(0), u8(0), u8(0xb8), u8(60),
+		u8(0), u8(0), u8(0), u8(0x0f), u8(0x05)]
+	part.defined['main'] = true
+	part.labels['main'] = 0
+	part.defined['stop'] = true
+	part.labels['stop'] = 12
+	part.imports << 'stop'
+	part.bound['stop'] = unit.Definition{
+		offset:   12
+		function: true
+	}
+	part.fixups << unit.Fixup{
+		start:    0
+		length:   7
+		kind:     .got_address
+		name:     'stop'
+		register: 'rax'
+	}
+	bytes := link([part], Options{
+		entry:  'main'
+		target: host()
+		kind:   .pie
+	}) or { panic('the link failed: ${err.msg()}') }
+	// ET_DYN with a real entry point is the shape: the kernel maps the file at a
+	// base it picked and jumps to that base plus e_entry.
+	assert u16(bytes[16]) | (u16(bytes[17]) << 8) == u16(3)
+	assert le64(bytes, 24) != 0
+	path := scratch('pie')
+	os.write_file_array(path, bytes) or { panic(err) }
+	assert run_image(path) == 33
+}
+
+// The same kind with a name the C library answers: the image names libc, the
+// loader maps it and writes `exit`'s address into the slot the code calls
+// through, and the status the process leaves is the one the code put in edi. A
+// pie that could not reach a library function would either refuse the link or die
+// here.
+fn test_a_pie_link_calls_a_library_function() {
+	mut part := unit.Program{}
+	part.text = [u8(0xbf), u8(5), u8(0), u8(0), u8(0), u8(0xff), u8(0x15), u8(0), u8(0), u8(0),
+		u8(0), u8(0xb8), u8(60), u8(0), u8(0), u8(0), u8(0), u8(0x0f), u8(0x05)]
+	part.defined['main'] = true
+	part.labels['main'] = 0
+	part.imports << 'exit'
+	part.fixups << unit.Fixup{
+		start:  5
+		length: 6
+		kind:   .call_import
+		name:   'exit'
+	}
+	bytes := link([part], Options{
+		entry:  'main'
+		target: host()
+		kind:   .pie
+	}) or { panic('the link failed: ${err.msg()}') }
+	path := scratch('pie_call')
+	os.write_file_array(path, bytes) or { panic(err) }
+	assert run_image(path) == 5
 }
 
 fn test_link_files_reads_an_object_and_writes_a_runnable_image() {

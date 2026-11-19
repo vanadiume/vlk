@@ -70,8 +70,9 @@ pub mut:
 	// output is the path the image is written to, for the high entries. Empty
 	// means the caller wants the bytes and no file.
 	output string
-	// kind is which of the container's three shapes the image takes: a dynamic
-	// program, a static program, or a shared object.
+	// kind is which of the container's four shapes the image takes: a dynamic
+	// program, a position-independent executable, a static program, or a shared
+	// object.
 	kind output.Kind
 	// container is what the caller asks the container for beyond the kind: an
 	// executable stack, eager binding, a read-only relocation segment, a soname.
