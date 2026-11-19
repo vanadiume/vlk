@@ -24,6 +24,14 @@ Done:
   read into units.
 - `vlk.merge`, `vlk.link` and `vlk.link_files`: the three depths a caller
   picks from.
+- `elf.Kind.pie`: a position-independent executable whose addresses are offsets,
+  with `PT_PHDR`, `DF_1_PIE`, and the relative relocations a loader applies.
+- A field that holds a symbol's absolute address, in a pie or a shared object, is
+  written as the symbol's place in the image beside an `R_X86_64_RELATIVE` entry,
+  with an undefined weak name left as zero and a four-byte field refused by name.
+  An entry over the code sets `DF_TEXTREL`.
+- vcc's `-pie`/`-fPIE` and vvd's `-pie` ask for this kind, and both trees run
+  the image at the base the loader chose.
 
 Left:
 

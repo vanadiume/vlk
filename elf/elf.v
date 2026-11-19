@@ -12,13 +12,17 @@ import vanadiume.vlk.unit
 // loader walks to learn how many symbols there are, a .rela.dyn with one
 // relocation per imported function, and the slots those relocations fill.
 //
-// There are three kinds of image and one writer behind them. A `.program` is
+// There are four kinds of image and one writer behind them. A `.program` is
 // the dynamic one: an interpreter, a DT_NEEDED entry per library, and every
-// address settled here or by a loader. A `.static_program` resolves its
-// libraries into the file, so it names no interpreter and no library, and the
-// kernel starts it alone. A `.shared` is a file another program loads: no
-// interpreter, no entry point, and every address that points into the image is
-// an offset a loader turns into an address once it has chosen where to put it.
+// address settled here or by a loader, at the load base the image was written
+// for. A `.pie` is that image placed by its loader: it names the same
+// interpreter and libraries, and every address that points into it is an offset
+// a relocation adds the base to, which is what lets the kernel map it wherever
+// it likes. A `.static_program` resolves its libraries into the file, so it
+// names no interpreter and no library, and the kernel starts it alone. A
+// `.shared` is a file another program loads: no interpreter, no entry point, and
+// every address that points into the image is an offset a loader turns into an
+// address once it has chosen where to put it.
 //
 // The image is built in one pass over a fixed order of parts, because every
 // offset in it is the size of what came before: interpreter, code, string table,
@@ -39,10 +43,10 @@ pub const elf_class_64 = u8(2)
 pub const elf_data_little_endian = u8(1)
 const elf_version_current = u8(1)
 const elf_type_exec = u16(2)
-// elf_type_dyn is a shared object: a file the kernel does not start and a
-// loader maps on behalf of a program that asked for it. It has no entry point
-// of its own, and every address in it that points into it is an offset a loader
-// turns into an address once it has chosen where the object goes.
+// elf_type_dyn is a file whose addresses are offsets: a shared object a loader
+// maps on behalf of a program that asked for it, or a position-independent
+// executable a kernel maps at a base it picked. The one a kernel starts names an
+// interpreter and has an entry point; the one it does not has neither.
 const elf_type_dyn = u16(3)
 
 const elf_header_size = u16(64)
@@ -59,6 +63,12 @@ const elf_program_header_count = u16(4)
 pub const elf_ph_type_load = u32(1)
 pub const elf_ph_type_dynamic = u32(2)
 pub const elf_ph_type_interp = u32(3)
+// PT_PHDR names the program header table itself. A position-independent
+// executable's program headers hold offsets, so a loader reading the table's own
+// address from one of them adds nothing to it; this header is where the loader
+// learns where the kernel mapped the table, and it is what tells it the base the
+// rest of the table is measured from.
+pub const elf_ph_type_phdr = u32(6)
 // PT_TLS names the thread-local storage the image defines. The kernel does not
 // map it; the runtime reads it before the first instruction runs and gives every
 // thread its own copy of the block: p_filesz bytes copied from p_vaddr, then
@@ -125,14 +135,83 @@ pub const dt_flags = u64(30)
 pub const dt_flags_1 = u64(0x6ffffffb)
 pub const df_bind_now = u64(0x8)
 pub const df_1_now = u64(0x1)
+// DF_1_PIE says the file is a position-independent executable: a program the
+// kernel starts, whose addresses the loader has to add its base to. A loader
+// reads it to tell such a file from a shared object, which is otherwise the same
+// container, and refuses to load it as a library a second time. GNU ld and lld
+// both write it into a `-pie` link, and the flags share one DT_FLAGS_1 entry.
+pub const df_1_pie = u64(0x08000000)
+// DF_TEXTREL says the loader writes into the image's code while it relocates.
+// A relative entry over a field in the code is that write: the link had to put a
+// field there, because the code holds an address rather than a distance, and the
+// loader fills it in. GNU ld sets it for the same reason and warns about it, and
+// a loader reads it before it decides whether the text it mapped may be written.
+pub const df_textrel = u64(0x4)
+
+// DynamicFlags is what an image promises about how it is loaded, as the two
+// entries that carry the promises. Each of the three facts is one bit in one of
+// the two entries, so they share a record rather than costing one each:
+// DF_BIND_NOW and DF_1_NOW say every import is resolved before the first
+// instruction, DF_TEXTREL says the loader writes into the code while it
+// relocates, and DF_1_PIE says the file is a program the kernel starts rather
+// than a library. The table is sized from this value and written from it, so the
+// count and the contents cannot disagree about how many records there are.
+struct DynamicFlags {
+mut:
+	flags   u64
+	flags_1 u64
+	// flags_present and flags_1_present say whether the entry has anything to
+	// say at all. An image with no promise writes neither, which is what every
+	// image written before these entries existed got.
+	flags_present   bool
+	flags_1_present bool
+}
+
+// dynamic_flags is the promises an image makes, from the three facts that ask for
+// them. A flag asked for twice is still one bit, and a bit in DT_FLAGS does not
+// cost a DT_FLAGS_1 record.
+fn dynamic_flags(bind_now bool, textrel bool, is_pie bool) DynamicFlags {
+	mut value := DynamicFlags{}
+	if bind_now {
+		value.flags |= df_bind_now
+		value.flags_1 |= df_1_now
+		value.flags_present = true
+		value.flags_1_present = true
+	}
+	if textrel {
+		value.flags |= df_textrel
+		value.flags_present = true
+	}
+	if is_pie {
+		value.flags_1 |= df_1_pie
+		value.flags_1_present = true
+	}
+	return value
+}
+
+// dynamic_flag_entries is how many records those promises cost: one for each
+// entry that has something to say. BIND_NOW alone costs two, a pie costs one, a
+// text relocation costs one, and a pie that carries both costs the two it would
+// have cost with either alone.
+fn dynamic_flag_entries(flags DynamicFlags) int {
+	mut count := 0
+	if flags.flags_present {
+		count++
+	}
+	if flags.flags_1_present {
+		count++
+	}
+	return count
+}
 
 // dynamic_entry_count is how many entries the dynamic table holds: the eight
 // that describe the image's own tables, one DT_NEEDED per library it runs
-// against, two for each of the constructor tables the image has, two for the
-// BIND_NOW promise when -Wl,-z,now asked for it, and the null that ends it. It
-// is a function rather than a constant because the library count and the table
-// counts are not known until the program has been read.
-fn dynamic_entry_count(library_count int, init_array_count int, fini_array_count int, bind_now bool, has_soname bool) int {
+// against, two for each of the constructor tables the image has, the records
+// `dynamic_flag_entries` reports for the flags, one for a soname, and the null
+// that ends the table, which is one of the eight. It is a function rather than a
+// constant because the library count and the table counts are not known until the
+// program has been read.
+fn dynamic_entry_count(library_count int, init_array_count int, fini_array_count int, has_soname bool, flags DynamicFlags) int {
 	mut count := 9 + library_count
 	if has_soname {
 		count += 1
@@ -143,28 +222,26 @@ fn dynamic_entry_count(library_count int, init_array_count int, fini_array_count
 	if fini_array_count > 0 {
 		count += 2
 	}
-	if bind_now {
-		count += 2
-	}
+	count += dynamic_flag_entries(flags)
 	return count
 }
 
 // dynamic_table_size is how many bytes the table takes, which is what the
 // layout places after the relocations and what a PT_GNU_RELRO segment has to
 // cover when one is written.
-fn dynamic_table_size(program unit.Program, library_count int, bind_now bool, has_soname bool) int {
+fn dynamic_table_size(program unit.Program, library_count int, has_soname bool, flags DynamicFlags) int {
 	return dynamic_entry_count(library_count, program.init_array.count,
-		program.fini_array.count, bind_now, has_soname) * int(elf_dynamic_entry_size)
+		program.fini_array.count, has_soname, flags) * int(elf_dynamic_entry_size)
 }
 
 // A relocation that asks the loader to write a symbol's address into a slot.
 pub const relocation_glob_dat = u64(6)
 // A relocation that asks the loader to add the base it loaded the image at to
 // an addend and write the sum into the eight bytes the entry names. It is what
-// a shared object carries for an address that points into the object itself:
-// the address is settled when the object is mapped and not before, so what the
-// file holds is the offset and the loader adds where it went. It is
-// R_X86_64_RELATIVE in this machine's psABI.
+// a shared object or a position-independent executable carries for an address
+// that points into the image itself: the address is settled when the image is
+// mapped and not before, so what the file holds is the offset and the loader
+// adds where it went. It is R_X86_64_RELATIVE in this machine's psABI.
 pub const relocation_relative = u64(8)
 // A relocation that asks the loader to write a symbol's address into the eight
 // bytes it names, which is what an imported function's address needs when it is
@@ -214,8 +291,9 @@ const plt_stub_size = 6
 // start of the file. The image is one segment that starts at file offset zero,
 // so a file offset and a virtual address differ by the load base and nothing
 // else, which is what lets the references be patched in file-offset arithmetic.
-// For a shared object the load base this module writes is zero, because where it
-// goes is the loader's to choose and not this module's to know.
+// For a shared object or a position-independent executable the load base this
+// module writes is zero, because where it goes is the loader's to choose and not
+// this module's to know.
 struct Sections {
 	interp int
 	text   int
@@ -271,12 +349,13 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 }
 
 // write_options wraps a program in an ELF64 image of the kind the command line
-// asked for. `.program` is the dynamic one, `.static_program` resolves every
-// library into the file, and `.shared` is a file another program loads with
-// dlopen. The three share every part that does not depend on how the file is
-// used; what changes between them is the interpreter, the libraries named, the
-// base added to an address that points into the image, and what the symbol table
-// exports.
+// asked for. `.program` is the dynamic one, `.pie` is that image placed by its
+// loader, `.static_program` resolves every library into the file, and `.shared`
+// is a file another program loads with dlopen. The four share every part that
+// does not depend on how the file is used; what changes between them is the
+// interpreter, the libraries named, the base added to an address that points
+// into the image, what the symbol table exports, and whether the header carries
+// an entry point.
 //
 // `options` is what the -Wl, flags added: an executable or non-executable stack,
 // the BIND_NOW promise in the dynamic table, and a PT_GNU_RELRO segment over the
@@ -289,16 +368,18 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	machine.check_encoders()!
 	check_kind(program, kind)!
 	shared := kind == .shared
-	// A shared object is placed by whoever loads it, so this module adds no base
-	// to anything: every address that points into the image is written as an
-	// offset and travels with a relocation that adds the real base. A program,
-	// static or dynamic, is placed at the target's own load base.
-	base := if shared { u64(0) } else { machine.load_base }
-	// The loader's path, with the terminator the kernel expects. Only a dynamic
-	// program names one: a static program is started by the kernel alone, and a
+	// A shared object and a position-independent executable are placed by
+	// whoever loads them, so this module adds no base to anything: every address
+	// that points into the image is written as an offset and travels with a
+	// relocation that adds the real base. A program, static or dynamic, is
+	// placed at the target's own load base.
+	base := if placed_by_the_loader(kind) { u64(0) } else { machine.load_base }
+	// The loader's path, with the terminator the kernel expects. A program the
+	// kernel starts with a loader names one, whether the link chose its base or
+	// the kernel did: a static program is started by the kernel alone, and a
 	// shared object is not started by the kernel at all.
 	mut interp := []u8{}
-	if kind == .program {
+	if kind == .program || kind == .pie {
 		interp = machine.interpreter.bytes()
 		interp << u8(0)
 	}
@@ -341,7 +422,9 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	}
 	// The names this image defines and offers to whatever loads it. Only a
 	// shared object exports: a program, static or dynamic, is the whole file
-	// and nothing looks a name up in it.
+	// and nothing looks a name up in it, and a position-independent executable
+	// is a program even though its container is the shared object's. Nothing
+	// loads it beside itself, so it has no names to offer.
 	exports := if shared { export_names(program) } else { []string{} }
 	for name in exports {
 		symbol_names[name] = dynstr.len
@@ -358,7 +441,9 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	}
 	// The name the shared object records as its own. Only a shared object has
 	// one, and only when -Wl,-soname named it: a program is never looked up by
-	// name, and an object with no name records none, which is what ld writes.
+	// name, and an object with no name records none, which is what ld writes. A
+	// position-independent executable is a program here too: the loader maps it
+	// because the kernel handed it over, not because anything named it.
 	soname_at := if kind == .shared && options.soname != '' {
 		at := dynstr.len
 		dynstr << options.soname.bytes()
@@ -375,9 +460,10 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	external := external_imports(program, kind)
 	indices := symbol_indices(program)
 	// The relocations the loader applies that name a symbol, and the ones that
-	// only add the load base. The second kind is a shared object's, and it is
-	// the count that sizes the table; the entries themselves are written where
-	// the addresses they cover are.
+	// only add the load base. The second kind is a shared object's or a
+	// position-independent executable's, and it is the count that sizes the
+	// table; the entries themselves are written where the addresses they cover
+	// are.
 	loader_data := loader_data_count(program, kind)
 	// The names this image defines and something reaches through the global
 	// offset table. Each needs a slot of its own, after the imports' slots,
@@ -391,6 +477,15 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	irelative := irelative_count(program, extra)
 	relocation_total := external + program.copy_objects.len + loader_data + relative +
 		irelative
+	// A relative entry over a field in the code is a text relocation: the loader
+	// writes into the text while it relocates, and DT_FLAGS has to say so. Only
+	// the kinds a loader places carry relative entries, so only they can have
+	// one.
+	textrel := placed_by_the_loader(kind) && absolute_text_field(program)
+	// The promises the dynamic table states, computed once: the table's size
+	// comes from the same value that fills it, so a flag that costs a record
+	// cannot be counted by one rule and written by another.
+	flags := dynamic_flags(options.bind_now, textrel, kind == .pie)
 	// A thread-local block turns into a PT_TLS header, and a dynamic table the
 	// runtime reads turns into a PT_DYNAMIC header. The two are counted here
 	// because the header table's size is what every offset after it counts
@@ -421,7 +516,7 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	// The dynamic table's bytes, counted once: the layout places it, the header
 	// it turns into reports its size, and PT_GNU_RELRO covers it.
 	dynamic_size := if has_dynamic {
-		dynamic_table_size(program, libraries.len, options.bind_now, soname_at >= 0)
+		dynamic_table_size(program, libraries.len, soname_at >= 0, flags)
 	} else {
 		0
 	}
@@ -443,11 +538,11 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 		kind)
 	emit_hash(mut output, program, sections, external, exports.len, kind)
 	emit_relocations(mut output, program, sections, indices, external, base, loader_data,
-		extra, shared, kind)!
+		extra, kind)!
 	// A static program writes no table here, and no header points at one.
 	if has_dynamic {
 		emit_dynamic(mut output, sections, program, dynstr.len, needed, soname_at, base,
-			relocation_total, options.bind_now)
+			relocation_total, flags)
 	}
 	// The unwind table and the header that indexes it are written here rather
 	// than by a relocation: the layout has settled where the code and the two
@@ -459,17 +554,19 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 		sections.eh_frame, sections.eh_frame_hdr))
 	// A shared object has no entry point: the loader calls the initializers and
 	// then whatever the program that loaded it names, and there is no place in
-	// the file for the kernel to jump to.
+	// the file for the kernel to jump to. A position-independent executable has
+	// one, and it is an offset like every other address in the image: the kernel
+	// adds the base it mapped the file at before it jumps there.
 	entry := if shared { u64(0) } else { base + u64(sections.text + program.entry_place) }
-	e_type := if shared { elf_type_dyn } else { elf_type_exec }
+	e_type := if shared || kind == .pie { elf_type_dyn } else { elf_type_exec }
 	emit_header(mut output, machine, entry, e_type, header_count)
 	emit_program_headers(mut output, machine, sections, program, interp.len, dynamic_size,
-		kind, has_tls, has_eh_frame, has_relro, executable_stack, base)
+		kind, header_count, has_tls, has_eh_frame, has_relro, executable_stack, base)
 	patch(mut output, program, machine, sections, base, extra)!
 	return output
 }
 
-// check_kind refuses the two links whose input this container cannot honestly
+// check_kind refuses the links whose input this container cannot honestly
 // finish, before a byte is written. Each refusal names the thing that cannot be
 // resolved, because a file that loads with an address left to zero is worse than
 // a link that stops and says which name it could not place.
@@ -501,22 +598,93 @@ fn check_kind(program unit.Program, kind Kind) ! {
 			if program.copy_objects.len > 0 {
 				return error('${program.copy_objects[0]} is a library object this link holds a copy of, and a shared object does not copy a library object into itself')
 			}
+			refuse_a_narrow_absolute(program)!
+		}
+		.pie {
+			// A copy relocation is the shape an image whose addresses the link
+			// settles itself uses: the storage the copy fills is at an address
+			// the link wrote down, and the library's own references to the name
+			// find it there. A position-independent executable has no storage
+			// of that name to fill, the same way a shared object has none, so
+			// the input that asks for one is refused rather than written as an
+			// image that would copy a library's object over its own data.
+			if program.copy_objects.len > 0 {
+				return error('${program.copy_objects[0]} is a library object this link holds a copy of, and a position-independent executable does not copy a library object into itself')
+			}
+			refuse_a_narrow_absolute(program)!
 		}
 		.program {}
 	}
 }
 
+// refuse_a_narrow_absolute refuses a named absolute field of four bytes in an
+// image a loader places. The relative entry that carries such a field writes
+// eight bytes, so a narrower field would have its neighbours written with it, and
+// the value the entry writes is the offset the link put in the field plus the
+// base, which is eight bytes wide whatever the field is. A four-byte absolute
+// address is the shape an image has when the link knows the address, which is the
+// shape this kind is not.
+fn refuse_a_narrow_absolute(program unit.Program) ! {
+	for relocation in program.relocations {
+		if relocation.width != .narrow || !absolute_field(program, relocation) {
+			continue
+		}
+		return error('${relocation.name} is a 32-bit absolute address, and a position-independent image has no form for one: a relative relocation writes eight bytes with the base added, so a four-byte field cannot hold an address this image only knows as an offset')
+	}
+}
+
+// absolute_field is a field that holds a name's absolute address and that an
+// image a loader places carries as an offset: the link writes the place the name
+// has in the image, and a relative relocation beside the field adds the base the
+// loader chose. Two names are not carried that way. A name a library answers has
+// no place here to point at, and its field holds what R_X86_64_64 asks the loader
+// to write instead. An undefined weak name stands for zero, which is the same
+// number at every base, so the field already holds what it means and an entry
+// would add a base to it.
+//
+// This is the one predicate the count and the entries are made from, so the table
+// the layout sized and the table the emitter fills are the same length by
+// construction.
+fn absolute_field(program unit.Program, relocation unit.Relocation) bool {
+	if relocation.kind != .absolute || relocation.name == '' {
+		return false
+	}
+	if relocation.name in program.weak_imports && relocation.name !in program.bound {
+		return false
+	}
+	if relocation.name in program.imports && relocation.name !in program.bound {
+		return false
+	}
+	return true
+}
+
+// absolute_text_field says whether the image carries a relative entry over a field
+// in its code, which is the text relocation DT_FLAGS has to announce: the loader
+// writes into the text while it relocates, and the segment has to be one it may
+// write to.
+fn absolute_text_field(program unit.Program) bool {
+	for relocation in program.relocations {
+		if relocation.place == .text && absolute_field(program, relocation) {
+			return true
+		}
+	}
+	return false
+}
+
 // program_header_count is how many program headers the kind is written with: a
-// dynamic program names its interpreter and has four, a shared object has the
-// load, dynamic and stack headers, and a static program has the load and stack
-// headers alone, because it carries no dynamic table for a loader to read and
-// nothing loads it. An image with thread-local storage adds one more, the PT_TLS
-// header the runtime reads the block out of, and it is a header of its own for
-// every kind that defines a thread-local. A PT_GNU_RELRO segment is one more
-// when the link asked for one and the image has data for it to cover.
+// program names its interpreter and has four, a position-independent executable
+// names one too and adds the header that says where the table the kernel read
+// landed, a shared object has the load, dynamic and stack headers, and a static
+// program has the load and stack headers alone, because it carries no dynamic
+// table for a loader to read and nothing loads it. An image with thread-local
+// storage adds one more, the PT_TLS header the runtime reads the block out of,
+// and it is a header of its own for every kind that defines a thread-local. A
+// PT_GNU_RELRO segment is one more when the link asked for one and the image has
+// data for it to cover.
 fn program_header_count(kind Kind, has_tls bool, has_eh_frame bool, has_relro bool) int {
 	mut count := match kind {
 		.program { int(elf_program_header_count) }
+		.pie { int(elf_program_header_count) + 1 }
 		.static_program { 2 }
 		.shared { 3 }
 	}
@@ -564,14 +732,16 @@ fn loader_data_count(program unit.Program, kind Kind) int {
 	return program.import_data_count()
 }
 
-// relative_count is how many addresses a shared object carries as offsets beside
-// the relocation that adds the load base to them: the slot of every import whose
-// definition is inside the image, the slot of every name the image defines that
-// something reaches through the table, and the address every data fixup writes
-// for a name the image defines. Every other kind of image settles those
-// addresses itself and needs none.
+// relative_count is how many addresses an image a loader places carries as offsets
+// beside the relocation that adds the load base to them: the slot of every import
+// whose definition is inside the image, the slot of every name the image defines
+// that something reaches through the table, the address every data fixup writes
+// for a name the image defines, and every field that holds a name's absolute
+// address. Every other kind of image settles those addresses itself and needs
+// none. The three predicates are the three `emit_relocations` reads, so the table
+// cannot be sized for one set of entries and filled with another.
 fn relative_count(program unit.Program, kind Kind, extra []string) int {
-	if kind != .shared {
+	if !placed_by_the_loader(kind) {
 		return 0
 	}
 	mut count := extra.len
@@ -582,6 +752,11 @@ fn relative_count(program unit.Program, kind Kind, extra []string) int {
 	}
 	for fixup in program.data_fixups {
 		if fixup.kind != .import_address {
+			count++
+		}
+	}
+	for relocation in program.relocations {
+		if absolute_field(program, relocation) {
 			count++
 		}
 	}
@@ -780,8 +955,9 @@ fn layout(program unit.Program, machine target.Target, interp_len int, dynstr_le
 	rela := offset
 	// One relocation per external import, one copy relocation per object this
 	// image holds a copy of, one per address in the writable data that names a
-	// symbol the loader resolves, and, for a shared object, one per address that
-	// points into the image and waits for the base it is loaded at.
+	// symbol the loader resolves, and, for a shared object or a
+	// position-independent executable, one per address that points into the image
+	// and waits for the base it is loaded at.
 	offset = align(offset + relocation_total * elf_relocation_size, 8)
 	// A static program carries no dynamic table: no loader runs before it and
 	// nothing reads one, which is the shape a reader looks for to tell a static
@@ -946,10 +1122,10 @@ fn hash_size(symbol_count int) int {
 // address it must hold is known here rather than to a loader. The definition
 // says whether it is an offset into the code or into the writable data, and the
 // slot gets that address at the load base, which is the address the loader would
-// have written had the symbol come from outside. For a shared object the load
-// base is zero, so what the slot holds is the file offset; `emit_relocations`
-// pairs it with the R_X86_64_RELATIVE entry that adds the real base when the
-// object is mapped.
+// have written had the symbol come from outside. For a shared object or a
+// position-independent executable the load base is zero, so what the slot holds
+// is the file offset; `emit_relocations` pairs it with the R_X86_64_RELATIVE
+// entry that adds the real base when the image is mapped.
 // iplt_end is where the array of IRELATIVE entries this image carries stops. The
 // array is what the C library's startup walks, from the name at its front to the
 // name at its back, calling each entry's resolver. A link defines those two
@@ -997,9 +1173,10 @@ fn emit_bound_slots(mut output []u8, program unit.Program, sections Sections, ba
 // something reaches through the global offset table, after the imports' slots.
 // The address is the definition's own, which is what a slot holds: the same
 // treatment the bound imports' slots get, and for the same reason, since a name
-// the image settled needs no library to answer for it. A shared object's base is
-// zero here, so the slot holds the file offset and the R_X86_64_RELATIVE entry
-// emit_relocations writes beside it adds the base the loader chose.
+// the image settled needs no library to answer for it. A shared object's or a
+// position-independent executable's base is zero here, so the slot holds the file
+// offset and the R_X86_64_RELATIVE entry emit_relocations writes beside it adds
+// the base the loader chose.
 fn emit_extra_slots(mut output []u8, program unit.Program, sections Sections, extra []string, base u64) ! {
 	for i, name in extra {
 		at := relocation_referent_of(program, sections, name)!
@@ -1147,9 +1324,11 @@ fn emit_hash(mut output []u8, program unit.Program, sections Sections, external 
 // the slot a call reads (R_X86_64_GLOB_DAT), copies a library object into this
 // image's storage (R_X86_64_COPY), or writes an imported symbol's address into
 // the eight bytes a data fixup points at (R_X86_64_64). The last run, which only
-// a shared object has, names no symbol: it tells the loader to add the base it
-// loaded this object at to an addend and store the sum, which is what every
-// address the object holds that points into itself needs.
+// an image placed by its loader has, names no symbol: it tells the loader to add
+// the base it loaded this image at to an addend and store the sum, which is what
+// every address the image holds that points into itself needs. A shared object
+// and a position-independent executable are the two images whose base is not the
+// link's to choose, so they are the two that carry it.
 //
 // A bound name gets no symbol relocation: its slot is filled by the layout, not
 // by the loader. The relocation's place is the import's own position in
@@ -1162,7 +1341,7 @@ fn emit_hash(mut output []u8, program unit.Program, sections Sections, external 
 // loader to call the resolver and store what it answers. The entry names no
 // symbol, because the answer is not a name's address, and its addend is the
 // resolver's own address, which the loader calls.
-fn emit_relocations(mut output []u8, program unit.Program, sections Sections, indices []int, external int, base u64, loader_data int, extra []string, shared bool, kind Kind) ! {
+fn emit_relocations(mut output []u8, program unit.Program, sections Sections, indices []int, external int, base u64, loader_data int, extra []string, kind Kind) ! {
 	mut entry := 0
 	// A static program writes no relocation for an import: there is no loader to
 	// read one, and every import still left over stands for zero rather than
@@ -1223,14 +1402,16 @@ fn emit_relocations(mut output []u8, program unit.Program, sections Sections, in
 			entry++
 		}
 	}
-	// The entries a shared object adds for the addresses it holds that point
-	// into itself: the slot of each import whose definition is inside the image,
-	// and the address each data fixup writes for a name the image defines. The
-	// place is the address of the field, and the addend is the file offset the
-	// field holds, which the loader turns into the value at the base it chose.
-	// The count is `relative`, and the two runs that read the program's own
-	// lists to fill it are the two `relative_count` counted.
-	if shared {
+	// The entries an image a loader places adds for the addresses it holds that
+	// point into itself: the slot of each import whose definition is inside the
+	// image, the address each data fixup writes for a name the image defines, the
+	// slot of each name the image defines that something reaches through the
+	// table, and each field that holds a name's absolute address. The place is
+	// the address of the field, and the addend is the offset the link wrote into
+	// it, which the loader turns into the value at the base it chose. The count is
+	// `relative`, and the predicates below are the ones `relative_count` reads, so
+	// the table and its contents cannot disagree.
+	if placed_by_the_loader(kind) {
 		for i, name in program.imports {
 			definition := program.bound[name] or { continue }
 			at := if definition.function {
@@ -1264,6 +1445,24 @@ fn emit_relocations(mut output []u8, program unit.Program, sections Sections, in
 			put_u64(mut output, where, u64(sections.got + (program.imports.len + i) * 8))
 			put_u64(mut output, where + 8, relocation_relative)
 			put_u64(mut output, where + 16, u64(at))
+			entry++
+		}
+		// A field that holds a name's absolute address is carried the same way:
+		// `patch` wrote the place the name has in the image into the field, and
+		// the entry adds the base to that number. The place is the field's own,
+		// wherever its unit marked it, and the addend is the value the field
+		// holds, from the same lookup `patch` resolved the name with, so the two
+		// cannot come out different.
+		for relocation in program.relocations {
+			if !absolute_field(program, relocation) {
+				continue
+			}
+			referent := relocation_referent_of(program, sections, relocation.name)!
+			where := sections.rela + entry * elf_relocation_size
+			put_u64(mut output, where,
+				u64(relocation_section(sections, relocation.place) + relocation.offset))
+			put_u64(mut output, where + 8, relocation_relative)
+			put_u64(mut output, where + 16, u64(referent + relocation.addend))
 			entry++
 		}
 	}
@@ -1305,13 +1504,13 @@ fn emit_relocations(mut output []u8, program unit.Program, sections Sections, in
 
 // emit_dynamic writes the table that tells the loader what the image needs: each
 // library it runs against, where the tables are, how big each record in them
-// is, and the promises -Wl,-z,now makes about binding. The DT_NEEDED entries
-// come first and are the only part of the table whose length depends on the
-// command line; a static program has none, so its table describes only its own
-// parts. The two constructor tables are named by address and size when the
+// is, and the promises the image makes about how it is loaded. The DT_NEEDED
+// entries come first and are the only part of the table whose length depends on
+// the command line; a static program has none, so its table describes only its
+// own parts. The two constructor tables are named by address and size when the
 // image has them, and they lie in the writable data, so the address is the load
 // base plus the storage's own offset.
-fn emit_dynamic(mut output []u8, sections Sections, program unit.Program, dynstr_len int, needed []int, soname_at int, base u64, relocation_total int, bind_now bool) {
+fn emit_dynamic(mut output []u8, sections Sections, program unit.Program, dynstr_len int, needed []int, soname_at int, base u64, relocation_total int, flags DynamicFlags) {
 	mut entries := [][]u64{}
 	// The object's own name goes first, which is where ld writes it.
 	if soname_at >= 0 {
@@ -1336,13 +1535,19 @@ fn emit_dynamic(mut output []u8, sections Sections, program unit.Program, dynstr
 		entries << [dt_fini_array, base + u64(sections.globals + program.fini_array.offset)]
 		entries << [dt_fini_arraysz, u64(program.fini_array.count * 8)]
 	}
-	// -Wl,-z,now: both spellings of "bind every import before the first
-	// instruction", which is what GNU ld writes and what a loader reads. This
-	// image's imports are already bound eagerly, one GLOB_DAT per name and no
-	// lazy stub, so the entries state the promise and change no slot.
-	if bind_now {
-		entries << [dt_flags, df_bind_now]
-		entries << [dt_flags_1, df_1_now]
+	// The promises the image makes about how it is loaded, one record for each
+	// entry that has something to say, which is what `dynamic_flag_entries`
+	// counted. BIND_NOW's two spellings say every import is resolved before the
+	// first instruction, and this image's imports are already bound eagerly, one
+	// GLOB_DAT per name and no lazy stub, so the entries state the promise and
+	// change no slot. DF_TEXTREL says the loader writes into the code while it
+	// relocates. DF_1_PIE says the file is a program the kernel starts and not a
+	// library.
+	if flags.flags_present {
+		entries << [dt_flags, flags.flags]
+	}
+	if flags.flags_1_present {
+		entries << [dt_flags_1, flags.flags_1]
 	}
 	entries << [dt_null, u64(0)]
 	for i, entry in entries {
@@ -1354,7 +1559,9 @@ fn emit_dynamic(mut output []u8, sections Sections, program unit.Program, dynstr
 // emit_header writes the ELF header: what the file is, which machine it runs
 // on, where execution starts, and where the program headers are. A shared object
 // has no entry point, so its e_entry is zero, and its type is ET_DYN: the kernel
-// does not start it, a loader maps it.
+// does not start it, a loader maps it. A position-independent executable has the
+// same type and a real entry point: the kernel maps the file at a base it picked
+// and jumps to that base plus e_entry, so e_entry itself is an offset.
 fn emit_header(mut output []u8, machine target.Target, entry u64, e_type u16, header_count int) {
 	put(mut output, 0, elf_magic)
 	output[4] = elf_class_64
@@ -1386,11 +1593,30 @@ fn emit_header(mut output []u8, machine target.Target, entry u64, e_type u16, he
 // why it is passed in rather than read off the kind. `executable_stack` is the
 // stack permission the link decided, which is the unit's own request unless
 // -Wl,-z,execstack or -Wl,-z,noexecstack overrode it.
-fn emit_program_headers(mut output []u8, machine target.Target, sections Sections, program unit.Program, interp_len int, dynamic_size int, kind Kind, has_tls bool, has_eh_frame bool, has_relro bool, executable_stack bool, base u64) {
+fn emit_program_headers(mut output []u8, machine target.Target, sections Sections, program unit.Program, interp_len int, dynamic_size int, kind Kind, header_count int, has_tls bool, has_eh_frame bool, has_relro bool, executable_stack bool, base u64) {
 	mut at := int(elf_header_size)
-	// PT_INTERP: the loader the kernel hands the process to. Only a dynamic
-	// program names one; the other two kinds write no header here.
-	if kind == .program {
+	// PT_PHDR: the program header table itself, first in the table where ld puts
+	// it. A pie's addresses are offsets, so a loader that read this table's
+	// address out of the table would be reading the offset the link wrote rather
+	// than where the kernel mapped it; the header is how the loader learns the
+	// base every other entry is measured from. A program whose base the link chose
+	// needs none: what the table says is already absolute.
+	if kind == .pie {
+		size := u64(header_count) * u64(elf_program_header_size)
+		put_u32(mut output, at, elf_ph_type_phdr)
+		put_u32(mut output, at + 4, elf_ph_flags_read)
+		put_u64(mut output, at + 8, u64(elf_header_size))
+		put_u64(mut output, at + 16, base + u64(elf_header_size))
+		put_u64(mut output, at + 24, base + u64(elf_header_size))
+		put_u64(mut output, at + 32, size)
+		put_u64(mut output, at + 40, size)
+		put_u64(mut output, at + 48, 8)
+		at += int(elf_program_header_size)
+	}
+	// PT_INTERP: the loader the kernel hands the process to. A program names one
+	// and so does a position-independent executable; the other two kinds write
+	// no header here.
+	if kind == .program || kind == .pie {
 		put_u32(mut output, at, elf_ph_type_interp)
 		put_u32(mut output, at + 4, elf_ph_flags_read)
 		put_u64(mut output, at + 8, u64(sections.interp))
@@ -1495,7 +1721,8 @@ fn emit_program_headers(mut output []u8, machine target.Target, sections Section
 // the parts are in place, because a displacement depends on the whole layout.
 // `base` is the number an address that points into the image is written at: the
 // target's load base for a program, static or dynamic, and zero for a shared
-// object, whose addresses are offsets until a loader places it.
+// object or a position-independent executable, whose addresses are offsets until
+// a loader places them.
 fn patch(mut output []u8, program unit.Program, machine target.Target, sections Sections, base u64, extra []string) ! {
 	for fixup in program.fixups {
 		referent := referent_of(program, sections, fixup.kind, fixup.name, extra)!
@@ -1587,9 +1814,10 @@ fn patch(mut output []u8, program unit.Program, machine target.Target, sections 
 	// dynamic table fills them in (emit_relocations); every other kind is an
 	// address this image settles, and it is written here. The addend is the byte
 	// a part of the object starts at, so `&a[3]` writes the fourth element's
-	// address and not the first's. For a shared object the base is zero, so the
-	// address is written as its file offset and the R_X86_64_RELATIVE entry
-	// emit_relocations writes beside it adds the base the loader chose.
+	// address and not the first's. For a shared object or a
+	// position-independent executable the base is zero, so the address is written
+	// as its file offset and the R_X86_64_RELATIVE entry emit_relocations writes
+	// beside it adds the base the loader chose.
 	for fixup in program.data_fixups {
 		if fixup.kind == .import_address {
 			continue

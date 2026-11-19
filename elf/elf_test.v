@@ -377,6 +377,18 @@ fn se_phdr_of(bytes []u8, kind u32) int {
 	return -1
 }
 
+// se_phdr_count is how many headers of one kind the image carries, which is what
+// says whether a promise is stated once or twice.
+fn se_phdr_count(bytes []u8, kind u32) int {
+	mut count := 0
+	for i in 0 .. int(se16(bytes, 56)) {
+		if se32(bytes, se_phdr_at(bytes, i)) == kind {
+			count++
+		}
+	}
+	return count
+}
+
 // se_dynamic_has says whether the dynamic table names a tag at all, which is
 // how a test tells an entry that is absent from one whose value is zero.
 fn se_dynamic_has(bytes []u8, tag u64) bool {
@@ -957,4 +969,405 @@ fn test_the_relro_option_writes_a_segment_over_the_loader_tables() {
 	result := os.execute(os.quoted_path(path))
 	os.rm(path) or {}
 	assert result.exit_code == 7
+}
+
+// A position-independent executable is the shared object's container with a
+// program's entry point: ET_DYN, an interpreter, a real entry, and DF_1_PIE among
+// the flags. The entry names a file offset inside the code rather than the start
+// of the file, and every address the dynamic table carries is an offset for the
+// same reason: where the image goes is the kernel's to choose, so the link cannot
+// add a base to anything.
+fn test_a_pie_is_a_dynamic_image_with_an_entry_point() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.text[0] = u8(0x48)
+	program.defined['main'] = true
+	program.labels['main'] = 0
+	bytes := write(program, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	assert se16(bytes, 16) == elf_type_dyn
+	assert se_has_interp(bytes)
+	assert se_phdr_of(bytes, elf_ph_type_dynamic) >= 0
+	// PT_PHDR tells the loader where the table it just read was mapped: the
+	// entries are offsets, so the address of the table is not one of them. Its
+	// size is the whole table, which is the one thing a loader reads from it.
+	phdr := se_phdr_of(bytes, elf_ph_type_phdr)
+	assert phdr >= 0
+	assert se64(bytes, phdr + 8) == u64(elf_header_size)
+	assert se64(bytes, phdr + 32) == u64(se16(bytes, 56)) * u64(elf_program_header_size)
+	entry := se64(bytes, 24)
+	assert entry != 0
+	assert entry < u64(bytes.len)
+	// The byte the entry names is the first instruction, so the header points at
+	// the code and not at the ELF header the image opens with.
+	assert bytes[int(entry)] == u8(0x48)
+	// It names a library to run against, the way a dynamic program does.
+	assert se_needed_count(bytes) > 0
+	// DF_1_PIE says the file is a program and not a library, and it is the only
+	// flag in the table until -Wl,-z,now asks for the other.
+	assert se_dynamic_value(bytes, dt_flags_1) or { panic('no DT_FLAGS_1') } == df_1_pie
+	assert !se_dynamic_has(bytes, dt_flags)
+	// Nothing loads it beside itself, so it exports nothing: a definition it
+	// holds is not a name in its dynamic table.
+	tables := se_tables(bytes, 0)
+	assert se_symbol_of(bytes, tables, 'main').name == ''
+	// Its tables are at file offsets, not at a load base.
+	assert (se_dynamic_value(bytes, dt_strtab) or { panic('no DT_STRTAB') }) < u64(bytes.len)
+	// -Wl,-z,now adds DT_FLAGS and shares the one DT_FLAGS_1 entry with DF_1_PIE,
+	// so the table grows by one record and not two.
+	now := write_options(program, machine, .pie, Options{
+		bind_now: true
+	}) or { panic('the pie was not written: ${err.msg()}') }
+	assert se_dynamic_value(now, dt_flags) or { panic('no DT_FLAGS') } == df_bind_now
+	assert se_dynamic_value(now, dt_flags_1) or { panic('no DT_FLAGS_1') } == (df_1_now |
+		df_1_pie)
+	assert se_dynamic_size(now) == se_dynamic_size(bytes) + elf_dynamic_entry_size
+}
+
+// pie_sequence is a position-independent program in two parts: code that reads a
+// function's address out of the global offset table and calls it, and that
+// function, which stops the process with a status. `lea rax, [rip + 0]` is the
+// reference to the slot, `mov rax, [rax]` reads the address the loader wrote
+// there, and `call rax` reaches the code. The four zero bytes of the
+// displacement are the fixup's to fill.
+fn pie_sequence(code u8) ![]u8 {
+	mut text := [u8(0x48), u8(0x8d), u8(0x05), u8(0), u8(0), u8(0), u8(0), u8(0x48), u8(0x8b),
+		u8(0x00), u8(0xff), u8(0xd0)]
+	text << exit_sequence(code)!
+	return text
+}
+
+// The image has to run, which is the only answer to whether the loader put it
+// where the code expects. A slot holding an address inside the image is written
+// as an offset beside an R_X86_64_RELATIVE entry; a link that skipped the entry
+// would leave the raw offset in the slot, and the call would jump into the first
+// page of the address space and die instead of exiting. Both the bytes and the
+// exit status are checked, so a failure says whether the table or the load is
+// wrong.
+fn test_a_pie_runs_where_its_loader_puts_it() {
+	machine := se_target()
+	code := pie_sequence(42) or { panic('the sequence was not built: ${err.msg()}') }
+	mut program := unit.Program{}
+	program.text = code
+	program.entry_place = 0
+	program.labels['target'] = 12
+	program.imports << 'target'
+	program.bound['target'] = unit.Definition{
+		offset:   12
+		function: true
+	}
+	program.fixups << unit.Fixup{
+		start:    0
+		length:   7
+		kind:     .got_address
+		name:     'target'
+		register: 'rax'
+	}
+	bytes := write(program, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	tables := se_tables(bytes, 0)
+	relative := se_relative_relocation(bytes, tables)
+	assert relative.info & 0xffffffff == relocation_relative
+	// The entry is the first instruction, so the target, twelve bytes into the
+	// code, is the entry plus twelve.
+	assert relative.addend == i64(se64(bytes, 24) + 12)
+	assert se64(bytes, int(relative.offset)) == u64(relative.addend)
+	path := os.join_path(os.temp_dir(), 'vlk_elf_pie_${os.getpid()}')
+	os.write_file_array(path, bytes) or { panic(err) }
+	os.chmod(path, 0o755) or { panic(err) }
+	result := os.exec([path])
+	os.rm(path) or {}
+	assert result.exit_code == 42
+}
+
+// -Wl,-z,relro over a pie covers the table the loader fills in, the relocations it
+// applies and the dynamic table it reads, which is the range a program's segment
+// covers, and the start is page aligned for the same reason: the loader rounds it
+// down before it calls mprotect, and a start inside a page the image's own data
+// lives in would make that data read-only. The range is checked against the slot
+// the bound name's relative entry fills as well as against the dynamic table, and
+// the image is run, which is what proves the loader wrote the slot before the
+// protection went up.
+fn test_a_pie_writes_a_relro_segment_over_its_loader_tables() {
+	machine := se_target()
+	code := pie_sequence(42) or { panic('the sequence was not built: ${err.msg()}') }
+	mut program := unit.Program{}
+	program.text = code
+	program.entry_place = 0
+	program.labels['target'] = 12
+	program.imports << 'target'
+	program.bound['target'] = unit.Definition{
+		offset:   12
+		function: true
+	}
+	program.fixups << unit.Fixup{
+		start:    0
+		length:   7
+		kind:     .got_address
+		name:     'target'
+		register: 'rax'
+	}
+	bytes := write_options(program, machine, .pie, Options{
+		relro: true
+	}) or { panic('the pie was not written: ${err.msg()}') }
+	// One segment: a second header over the same range would be two statements of
+	// one promise.
+	assert se_phdr_count(bytes, elf_ph_type_gnu_relro) == 1
+	at := se_phdr_of(bytes, elf_ph_type_gnu_relro)
+	start := se64(bytes, at + 8)
+	size := se64(bytes, at + 32)
+	assert size > 0
+	assert start % machine.page_size == 0
+	// The image's base is zero, so the address the header names is the offset.
+	assert se64(bytes, at + 16) == start
+	assert se64(bytes, at + 24) == start
+	// The range covers the slot the loader fills and the table it reads.
+	tables := se_tables(bytes, 0)
+	slot := se_relative_relocation(bytes, tables).offset
+	assert slot >= start
+	assert slot + 8 <= start + size
+	dynamic := u64(se_dynamic_offset(bytes))
+	assert start <= dynamic
+	assert start + size >= dynamic + u64(se_dynamic_size(bytes))
+	// Without the option there is no segment and one header fewer.
+	plain := write(program, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	assert se_phdr_count(plain, elf_ph_type_gnu_relro) == 0
+	assert se16(bytes, 56) == se16(plain, 56) + 1
+	path := os.join_path(os.temp_dir(), 'vlk_elf_pie_relro_${os.getpid()}')
+	os.write_file_array(path, bytes) or { panic(err) }
+	os.chmod(path, 0o755) or { panic(err) }
+	result := os.exec([path])
+	os.rm(path) or {}
+	assert result.exit_code == 42
+}
+
+// A copy relocation asks a loader to copy a library's object into this image's
+// storage, which is the shape of an image whose addresses the link settles
+// itself. A position-independent executable has no such storage to name, so the
+// refusal says so and names the object.
+fn test_a_pie_that_would_copy_a_library_object_is_refused() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.globals_blob = []u8{len: 8, init: u8(0)}
+	program.globals['stdout'] = unit.GlobalSlot{
+		offset: 0
+		width:  8
+	}
+	program.copy_objects << 'stdout'
+	write(program, machine, .pie) or {
+		assert err.msg().contains('stdout')
+		assert err.msg().contains('position-independent')
+		return
+	}
+	assert false, 'a pie was written with a copy relocation'
+}
+
+// A field that holds a name's absolute address is settled for an image a loader
+// places by writing the offset and a relative entry beside it: the loader adds the
+// base it mapped the image at. The field here is in the code, so the image is a
+// text relocation, and DT_FLAGS says so. The target is four bytes in rather than
+// at the start, so an addend of zero and an addend of the target are different
+// numbers.
+fn test_a_pie_writes_a_relative_entry_for_an_absolute_field_in_its_code() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.text[4] = u8(0xab)
+	program.defined['target'] = true
+	program.labels['target'] = 4
+	program.relocations << unit.Relocation{
+		offset: 8
+		kind:   .absolute
+		name:   'target'
+		width:  .wide
+	}
+	bytes := write(program, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	entry := se64(bytes, 24)
+	tables := se_tables(bytes, 0)
+	relative := se_relative_relocation(bytes, tables)
+	assert relative.info & 0xffffffff == relocation_relative
+	// The entry names the field, at the eighth byte of the code, and its addend
+	// is the target's place in the image, which is what the bytes hold.
+	assert relative.offset == entry + 8
+	assert relative.addend == i64(entry + 4)
+	assert se64(bytes, int(relative.offset)) == u64(relative.addend)
+	assert bytes[int(relative.addend)] == u8(0xab)
+	// The loader writes into the text while it relocates, so DT_FLAGS says so,
+	// and the pie's own flag is still the only DT_FLAGS_1 record.
+	assert se_dynamic_value(bytes, dt_flags) or { panic('no DT_FLAGS') } == df_textrel
+	assert se_dynamic_value(bytes, dt_flags_1) or { panic('no DT_FLAGS_1') } == df_1_pie
+	// DT_FLAGS is one record, which the table's size has to have made room for.
+	mut plain := unit.Program{}
+	plain.text = []u8{len: 16, init: u8(0x90)}
+	plain.defined['target'] = true
+	plain.labels['target'] = 4
+	without := write(plain, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	assert se_dynamic_size(bytes) == se_dynamic_size(without) + elf_dynamic_entry_size
+	assert !se_dynamic_has(without, dt_flags)
+}
+
+// The same field in the writable data is not a text relocation, because the loader
+// writes there anyway. The entry still names the field, and the addend is still
+// the target's place in the image.
+fn test_a_pie_writes_a_relative_entry_for_an_absolute_field_in_its_data() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.text[4] = u8(0xab)
+	program.globals_blob = []u8{len: 8, init: u8(0)}
+	program.defined['target'] = true
+	program.labels['target'] = 4
+	program.relocations << unit.Relocation{
+		offset: 0
+		place:  .data
+		kind:   .absolute
+		name:   'target'
+		width:  .wide
+	}
+	bytes := write(program, machine, .pie) or {
+		panic('the pie was not written: ${err.msg()}')
+	}
+	entry := se64(bytes, 24)
+	tables := se_tables(bytes, 0)
+	relative := se_relative_relocation(bytes, tables)
+	assert relative.info & 0xffffffff == relocation_relative
+	// The field is in the writable data, which is placed after the code, and it
+	// holds the offset the entry adds the base to.
+	assert relative.offset > entry + 16
+	assert relative.addend == i64(entry + 4)
+	assert se64(bytes, int(relative.offset)) == u64(relative.addend)
+	// One entry and no more: the table has room for exactly the field.
+	assert tables.relasz == elf_relocation_size
+	// Nothing is written into the code, so there is no textrel bit.
+	assert !se_dynamic_has(bytes, dt_flags)
+}
+
+// The rule is the container's and not the pie's: a shared object carries the same
+// field the same way. The entry's addend is the target's place in the image, and
+// the bytes at the place the entry names hold that number.
+fn test_a_shared_object_writes_a_relative_entry_for_an_absolute_field() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.text[4] = u8(0xab)
+	program.globals_blob = []u8{len: 8, init: u8(0)}
+	program.defined['target'] = true
+	program.labels['target'] = 4
+	program.relocations << unit.Relocation{
+		offset: 0
+		place:  .data
+		kind:   .absolute
+		name:   'target'
+		width:  .wide
+	}
+	bytes := write(program, machine, .shared) or {
+		panic('the shared object was not written: ${err.msg()}')
+	}
+	tables := se_tables(bytes, 0)
+	relative := se_relative_relocation(bytes, tables)
+	assert relative.info & 0xffffffff == relocation_relative
+	assert relative.addend != 0
+	assert bytes[int(relative.addend)] == u8(0xab)
+	assert se64(bytes, int(relative.offset)) == u64(relative.addend)
+	assert tables.relasz == elf_relocation_size
+	assert !se_dynamic_has(bytes, dt_flags)
+}
+
+// A four-byte absolute field cannot be carried: the relative entry writes eight
+// bytes, so the field's neighbours would be written with it. The refusal names the
+// reference and says what the image cannot do with it.
+fn test_a_pie_refuses_a_narrow_absolute_reference() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.defined['target'] = true
+	program.labels['target'] = 4
+	program.relocations << unit.Relocation{
+		offset: 8
+		kind:   .absolute
+		name:   'target'
+		width:  .narrow
+	}
+	write(program, machine, .pie) or {
+		assert err.msg().contains('target')
+		assert err.msg().contains('32-bit')
+		return
+	}
+	assert false, 'a pie was written with a four-byte absolute reference'
+}
+
+// A name nothing defines and nothing marks weak is still refused, and the refusal
+// comes from the reference rather than from the count: a name a library would have
+// answered has no place in the image to add a base to, so it gets no entry and the
+// field cannot be written.
+fn test_a_pie_refuses_an_absolute_reference_to_a_name_nothing_defines() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.imports << 'nowhere'
+	program.relocations << unit.Relocation{
+		offset: 8
+		kind:   .absolute
+		name:   'nowhere'
+		width:  .wide
+	}
+	write(program, machine, .pie) or {
+		assert err.msg().contains('nowhere')
+		return
+	}
+	assert false, 'a pie was written with an absolute reference to a name nothing defines'
+}
+
+// The shared object carries the field the same way, so it refuses it the same way.
+fn test_a_shared_object_refuses_a_narrow_absolute_reference() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.defined['target'] = true
+	program.labels['target'] = 4
+	program.relocations << unit.Relocation{
+		offset: 8
+		kind:   .absolute
+		name:   'target'
+		width:  .narrow
+	}
+	write(program, machine, .shared) or {
+		assert err.msg().contains('target')
+		assert err.msg().contains('32-bit')
+		return
+	}
+	assert false, 'a shared object was written with a four-byte absolute reference'
+}
+
+// The exception to the rule above: a field that holds the address of a name
+// nothing defines and the link marks weak stands for zero, and zero is the same
+// number at every base. A start file writes exactly this, so it gets no relative
+// entry: one would add the base to the zero and turn a skip into a jump.
+fn test_a_pie_with_an_undefined_weak_absolute_reference_is_written() {
+	machine := se_target()
+	mut program := unit.Program{}
+	program.text = []u8{len: 16, init: u8(0x90)}
+	program.relocations << unit.Relocation{
+		offset: 8
+		kind:   .absolute
+		name:   'never_defined'
+		width:  .wide
+	}
+	program.imports << 'never_defined'
+	program.weak_imports['never_defined'] = true
+	bytes := write(program, machine, .pie) or {
+		panic('a pie with an undefined weak absolute reference was refused: ${err.msg()}')
+	}
+	// The field holds the addend, which is zero, and no relocation names it.
+	tables := se_tables(bytes, 0)
+	assert se_relative_relocation(bytes, tables).info == 0
 }
