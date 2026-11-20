@@ -1,5 +1,19 @@
 module target
 
+// Format is the container an image is written in. It is the one fact a link
+// reads to decide which writer runs, and it is a field rather than a second kind
+// of Target so that the register files, the library search and the page size are
+// written once.
+//
+// The zero value is ELF, deliberately: a caller that builds a Target with the
+// fields it was compiled against keeps the meaning it had, and a link for a
+// second container is a value a caller sets rather than something every writer
+// has to guess.
+pub enum Format {
+	elf
+	pe
+}
+
 // Target is what a link cannot be written without knowing about the machine it
 // runs on and the system it runs under. A caller fills one, so this library never
 // carries a second copy of another tree's target description and a link for a
@@ -13,10 +27,30 @@ pub:
 	// name spells the machine and the system the way a command line does, and
 	// is what an error names when an input was built for another one.
 	name string
+	// format is the container this target's images are written in. The zero
+	// value is ELF, so a target built before this field existed keeps its
+	// meaning and a PE link is a value rather than a branch in a writer.
+	format Format = .elf
 	// word_size is the width of a register on the machine, in bytes.
 	word_size int
-	// elf_machine is the number an ELF64 header carries for this machine.
+	// elf_machine is the number an ELF64 header carries for this machine, and
+	// zero for a machine whose images are not ELF.
 	elf_machine u16
+	// coff_machine is the number a COFF header carries for this machine, and
+	// zero for a machine whose objects are not COFF.
+	coff_machine u16
+	// file_alignment is where a PE section's bytes start in the file, and zero
+	// for a container whose sections are not aligned in the file.
+	file_alignment u32
+	// subsystem is what a PE image tells the loader it is: a console program,
+	// a windowed one, or a library the loader maps for another image. Zero for
+	// a container without one.
+	subsystem u16
+	// dll_characteristics is the PE header's word of loader hints: whether the
+	// image moves from its preferred base, whether it opts into high entropy
+	// addresses, and whether its stack may be made non-executable. Zero for a
+	// container without one.
+	dll_characteristics u16
 	// page_size is the unit the loader maps the image in.
 	page_size u64
 	// load_base is the lowest address a non-position-independent image is loaded

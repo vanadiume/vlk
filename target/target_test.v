@@ -74,3 +74,33 @@ fn test_the_encodings_a_container_writes() {
 	}
 	assert false, 'a constant was loaded into a register the encoding cannot name'
 }
+
+// The Windows target is the same machine under another container. What is
+// checked here is the seam: the container is named, the fields that belong to
+// the other one are left empty, and the register files and encoders are the same
+// values rather than a second copy that could drift.
+fn test_the_windows_target_is_a_pe_link_of_the_amd64_machine() {
+	w := windows_x86_64()
+	assert w.format == .pe
+	assert w.coff_machine == coff_machine_amd64
+	assert w.word_size == 8
+	assert w.page_size == 0x1000
+	assert w.file_alignment == 0x200
+	assert w.load_base == 0x140000000
+	assert w.subsystem == subsystem_windows_cui
+	assert w.dll_characteristics & dll_dynamic_base != 0
+	assert w.dll_characteristics & dll_nx_compat != 0
+	// No ELF field is filled by a PE target, and no PE field by an ELF one.
+	assert w.elf_machine == 0
+	assert w.interpreter == ''
+	assert w.base_library == ''
+	assert w.library_dirs.len == 0
+	w.check_encoders() or { panic('the windows target is missing an encoder: ${err.msg()}') }
+}
+
+fn test_a_target_built_before_the_format_field_meant_elf() {
+	assert Target{}.format == .elf
+	host := host() or { panic('the tests need the host target') }
+	assert host.format == .elf
+	assert host.coff_machine == 0
+}
