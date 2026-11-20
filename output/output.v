@@ -28,7 +28,11 @@ pub type Options = elf.Options
 pub fn image(program unit.Program, machine target.Target, kind Kind, options Options) ![]u8 {
 	return match machine.format {
 		.elf { elf.write_options(program, machine, kind, options) }
-		.pe { pe.write(program, machine, pe_kind(kind)) }
+		.pe {
+			pe.write_options(program, machine, pe_kind(kind), pe.Options{
+				dll_name: options.soname
+			})
+		}
 	}
 }
 

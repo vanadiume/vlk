@@ -51,6 +51,7 @@ const data_directory_count = 16
 // another image rather than starts.
 const image_file_executable = u16(0x0002)
 const image_file_large_address_aware = u16(0x0020)
+const image_file_dll = u16(0x2000)
 
 // The section characteristics. A section holding code is executable and
 // readable; data is readable, and writable when the program writes it. The
@@ -99,15 +100,40 @@ mut:
 	file_size    int
 }
 
-// write turns one merged program into the bytes of a PE32+ image. Every section
-// the program's blobs name is placed, the imports become the import directory,
-// and each reference the merge left is filled with the number its kind asks for.
+// Options is what a caller asks this writer for beyond the kind.
+pub struct Options {
+pub:
+	// dll_name is the name a DLL records as its own, which is what another
+	// image's import table names and what the loader looks for. It is empty for
+	// an executable, which no one imports.
+	dll_name string
+	// pdb_path, when it names a file, adds a debug directory and a CodeView
+	// record pointing at it. The loader ignores both; a debugger reads them.
+	pdb_path string
+	// pdb_guid and pdb_age are the pair a PDB and its image agree on. A PDB
+	// this tree does not write, so a caller that wants a record it can match
+	// generates them itself.
+	pdb_guid [16]u8
+	pdb_age  u32
+}
+
+// write turns one merged program into the bytes of a PE32+ image, with no
+// options: an executable named after nothing, with no debug record.
 pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
+	return write_options(program, machine, kind, Options{})
+}
+
+// write_options is the same image with what the caller asked for beyond it: a
+// DLL's name and the PDB record its debugger looks for.
+pub fn write_options(program unit.Program, machine target.Target, kind Kind, options Options) ![]u8 {
 	if machine.format != .pe {
 		return error('the ${machine.name} target is not a PE target')
 	}
-	if kind == .dll {
-		return error('a PE DLL is not written yet: the image would need an export table and nothing here builds one')
+	if kind == .dll && options.dll_name == '' {
+		return error('a DLL records the name another image imports it by, and none was given')
+	}
+	if options.dll_name != '' && kind != .dll {
+		return error('the image records ${options.dll_name} as its own name and it is not a DLL')
 	}
 	if program.text.len == 0 {
 		return error('the program has no code')
@@ -169,7 +195,8 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 	// gave a section to is refused rather than duplicated, because two
 	// sections of one name in an image is a file no loader can map by name.
 	for section in program.sections {
-		if section.name in ['.text', '.rdata', '.data', '.idata', '.reloc', '.tls', '.tlsdir'] {
+		if section.name in ['.text', '.rdata', '.data', '.idata', '.reloc', '.tls', '.tlsdir',
+			'.edata', '.debug'] {
 			return error('the program carries a named section ${section.name}, which is a name the writer gives to a section it builds from the blobs')
 		}
 		if section.name == '' {
@@ -204,6 +231,31 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 			alignment:       8
 		}
 	}
+	// A DLL's exports are a section of their own. The table's length depends on
+	// the names and ordinals and not on any address, so it is sized with a
+	// table whose addresses are zero and written once the layout has said where
+	// the section is.
+	if kind == .dll {
+		probe := export_table(options.dll_name, export_table_entries(program.exports, 0), 0)!
+		sections << Section{
+			name:            '.edata'
+			data:            []u8{len: probe.data.len}
+			characteristics: scn_cnt_initialized_data | scn_mem_read
+			alignment:       4
+		}
+	}
+	// A debug record is placed like any other section: an entry and the record
+	// it describes, with the record's address and file offset filled in after
+	// the layout says where the section is.
+	if options.pdb_path != '' {
+		size := debug_entry_size + codeview_fixed_size + options.pdb_path.len + 1
+		sections << Section{
+			name:            '.debug'
+			data:            []u8{len: size}
+			characteristics: scn_cnt_initialized_data | scn_mem_read | scn_mem_discardable
+			alignment:       4
+		}
+	}
 	mut layout := lay(sections, machine)
 	// The import directory's own addresses are inside the section that holds
 	// it, so its bytes are written once the layout has said where that is.
@@ -212,6 +264,21 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 		layout.replace('.idata', plan.bytes(idata_rva))!
 	}
 	mut sites := []Site{}
+	if kind == .dll {
+		edata_rva := layout.address('.edata') or { return error('.edata was placed and the layout lost it') }
+		table := export_table(options.dll_name, resolve_exports(program, layout)!, edata_rva)!
+		layout.replace('.edata', table.data)!
+	}
+	if options.pdb_path != '' {
+		index := layout.index('.debug') or { return error('.debug was placed and the layout lost it') }
+		rva := layout.sections[index].rva
+		directory := codeview_directory(CodeView{
+			pdb_path: options.pdb_path
+			guid:     options.pdb_guid
+			age:      options.pdb_age
+		}, rva, layout.sections[index].raw_offset)!
+		layout.replace('.debug', directory.data)!
+	}
 	if program.tls_size > 0 {
 		data_rva := layout.address('.data') or { return error('.data was placed and the layout lost it') }
 		tls.index_rva = data_rva + tls.index_offset
@@ -385,7 +452,10 @@ fn headers(program unit.Program, machine target.Target, layout Layout, plan Impo
 	put(mut bytes, dos_header_size, dos_stub.bytes())
 	put(mut bytes, pe_header_offset, [u8(`P`), u8(`E`), u8(0), u8(0)])
 	coff := pe_header_offset + 4
-	characteristics := image_file_executable | image_file_large_address_aware
+	mut characteristics := image_file_executable | image_file_large_address_aware
+	if layout.address('.edata') != none {
+		characteristics |= image_file_dll
+	}
 	put_u16(mut bytes, coff, machine.coff_machine)
 	put_u16(mut bytes, coff + 2, u16(layout.sections.len))
 	put_u32(mut bytes, coff + 4, 0) // a timestamp is what makes two links differ
@@ -445,6 +515,14 @@ fn headers(program unit.Program, machine target.Target, layout Layout, plan Impo
 	if exceptions := layout.address('.pdata') {
 		put_u32(mut bytes, directories + 3 * 8, u32(exceptions))
 		put_u32(mut bytes, directories + 3 * 8 + 4, u32(layout.size_of('.pdata')))
+	}
+	if exports := layout.address('.edata') {
+		put_u32(mut bytes, directories, u32(exports))
+		put_u32(mut bytes, directories + 4, 40)
+	}
+	if debug := layout.address('.debug') {
+		put_u32(mut bytes, directories + 6 * 8, u32(debug))
+		put_u32(mut bytes, directories + 6 * 8 + 4, u32(debug_entry_size))
 	}
 	if thread_local := layout.address('.tlsdir') {
 		put_u32(mut bytes, directories + 9 * 8, u32(thread_local))
@@ -520,6 +598,53 @@ fn tls_alignment_characteristics(alignment int) u32 {
 		code++
 	}
 	return u32(code + 1) << scn_align_shift
+}
+
+// export_table_entries is the program's export list as the table builder takes
+// it, with every address set to the number given. It is how the section is sized
+// before the layout exists; the addresses are resolved after it does.
+fn export_table_entries(exports []unit.Export, rva int) []Export {
+	mut out := []Export{cap: exports.len}
+	for export in exports {
+		out << Export{
+			name:    export.name
+			rva:     rva
+			ordinal: export.ordinal
+		}
+	}
+	return out
+}
+
+// resolve_exports is where each exported name stands in the image, now that the
+// layout has settled every section. A name the image does not define is refused
+// rather than written as zero, because a loader that exports an address of zero
+// hands another image a fault instead of a symbol.
+fn resolve_exports(program unit.Program, layout Layout) ![]Export {
+	mut out := []Export{cap: program.exports.len}
+	for export in program.exports {
+		rva := if export.function {
+			text := layout.address('.text') or { return error('.text is not a section of this image') }
+			text + (program.labels[export.name] or {
+				return error('${export.name} is exported as a function and the image defines no code of that name')
+			})
+		} else {
+			if slot := program.read_only_globals[export.name] {
+				rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+				rdata + slot.offset
+			} else if slot := program.globals[export.name] {
+				data := layout.address('.data') or { return error('.data is not a section of this image') }
+				data + slot.offset
+			} else {
+				return error('${export.name} is exported as an object and the image defines no storage of that name')
+			}
+		}
+		out << Export{
+			name:    export.name
+			rva:     rva
+			ordinal: export.ordinal
+		}
+	}
+	return out
 }
 
 // section_characteristics is what a named section's kind means to a loader.

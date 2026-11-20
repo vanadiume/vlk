@@ -524,3 +524,168 @@ fn test_a_data_fixup_writes_the_address_and_records_it_for_the_loader() {
 	assert reloc_rva != 0
 	assert u32_at(image, raw_offset(image, int(reloc_rva)) + 8) == 0xA000 | (data_rva & 0xfff)
 }
+
+// A DLL is an executable whose exports another image calls, and the name it
+// records is the name an import table asks for. The test writes both halves and
+// runs the second: a loader that never found the export would stop before the
+// status the function returns.
+fn answer_dll() unit.Program {
+	mut part := unit.Program{}
+	part.text = [u8(0xb8), u8(42), u8(0), u8(0), u8(0), u8(0xc3)] // mov eax, 42; ret
+	part.labels['answer'] = 0
+	part.defined['answer'] = true
+	part.entry_place = 0
+	part.exports << unit.Export{
+		name:     'answer'
+		ordinal:  1
+		function: true
+	}
+	return part
+}
+
+fn calling_answer() unit.Program {
+	mut part := unit.Program{}
+	part.text = [
+		u8(0x48),
+		u8(0x83),
+		u8(0xec),
+		u8(0x28), // sub rsp, 0x28
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + answer]
+		u8(0x89),
+		u8(0xc1), // mov ecx, eax
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + ExitProcess]
+		u8(0x48),
+		u8(0x83),
+		u8(0xc4),
+		u8(0x28),
+		u8(0xc3),
+	]
+	part.labels['main'] = 0
+	part.defined['main'] = true
+	part.entry_place = 0
+	part.imports << 'answer'
+	part.imports << 'ExitProcess'
+	part.imports_by_library << unit.Import{
+		name:    'answer'
+		library: 'answer.dll'
+	}
+	part.imports_by_library << unit.Import{
+		name:    'ExitProcess'
+		library: 'kernel32.dll'
+	}
+	part.relocations << unit.Relocation{
+		offset: 6
+		place:  .text
+		kind:   .direct
+		name:   'answer'
+		addend: -4
+		width:  .narrow
+	}
+	// The second call's field begins at 14, and the instruction ends at 18.
+	part.relocations << unit.Relocation{
+		offset: 14
+		place:  .text
+		kind:   .direct
+		name:   'ExitProcess'
+		addend: -4
+		width:  .narrow
+	}
+	return part
+}
+
+fn test_a_dll_exports_a_name_and_an_image_that_imports_it_runs() {
+	windows := target.windows_x86_64()
+	dll := write_options(answer_dll(), windows, .dll, Options{
+		dll_name: 'answer.dll'
+	})!
+	exe := write(calling_answer(), windows, .executable)!
+	dir := scratch_dir()
+	dll_path := os.join_path(dir, 'answer.dll')
+	exe_path := os.join_path(dir, 'caller.exe')
+	os.write_file_array(dll_path, dll) or { panic(err) }
+	os.write_file_array(exe_path, exe) or { panic(err) }
+	// The headers say what the file is, and the export table names the
+	// function at the address its code was placed at.
+	directories := pe_header_offset + 4 + 20 + 112
+	assert u32_at(dll, directories) != 0
+	assert u32_at(dll, directories + 4) == 40
+	reader := '/usr/bin/llvm-readobj'
+	if os.exists(reader) {
+		headers := os.exec([reader, '--file-headers', '--coff-exports', dll_path])
+		assert headers.exit_code == 0, headers.output
+		assert headers.output.contains('IMAGE_FILE_DLL')
+		assert headers.output.contains('answer')
+		assert headers.output.contains('ExportTableRVA: ')
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping the run: no wine on this machine')
+		return
+	}
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', exe_path])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+}
+
+fn test_a_debug_directory_names_the_pdb_and_the_record_beside_it() {
+	windows := target.windows_x86_64()
+	mut guid := [16]u8{}
+	for i in 0 .. 16 {
+		guid[i] = u8(i + 1)
+	}
+	image := write_options(returning(), windows, .executable, Options{
+		pdb_path: 'C:\\build\\unit.pdb'
+		pdb_guid: guid
+		pdb_age:  3
+	})!
+	directories := pe_header_offset + 4 + 20 + 112
+	assert u32_at(image, directories + 6 * 8) != 0
+	assert u32_at(image, directories + 6 * 8 + 4) == 28
+	path := os.join_path(scratch_dir(), 'debug.exe')
+	os.write_file_array(path, image) or { panic(err) }
+	reader := '/usr/bin/llvm-readobj'
+	if !os.exists(reader) {
+		eprintln('skipping the read: no llvm-readobj on this machine')
+		return
+	}
+	result := os.exec([reader, '--coff-debug-directory', '--codeview', path])
+	assert result.exit_code == 0, result.output
+	// `llvm-readobj` decodes the record rather than printing its four-letter
+	// signature, so the check is on the fields it read out.
+	assert result.output.contains('unit.pdb')
+	assert result.output.contains('PDBSignature: 0x53445352')
+	assert result.output.contains('PDBAge: 3')
+	assert result.output.contains('Type: CodeView')
+}
+
+fn test_a_dll_without_a_name_is_refused() {
+	if _ := write_options(answer_dll(), target.windows_x86_64(), .dll, Options{}) {
+		assert false, 'a DLL records the name another image imports it by'
+	} else {
+		assert err.msg().contains('name')
+	}
+}
+
+fn test_an_export_the_image_does_not_define_is_refused() {
+	mut part := answer_dll()
+	part.exports << unit.Export{
+		name:     'missing'
+		function: true
+	}
+	if _ := write_options(part, target.windows_x86_64(), .dll, Options{
+		dll_name: 'answer.dll'
+	}) {
+		assert false, 'an exported name with no definition is a fault handed to another image'
+	} else {
+		assert err.msg().contains('missing')
+	}
+}

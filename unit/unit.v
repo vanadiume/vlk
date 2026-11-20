@@ -226,6 +226,21 @@ pub mut:
 	kind      SectionKind
 }
 
+// Export is one name an image offers to another image. A PE image keeps an
+// explicit list, because nothing in a COFF object marks a definition as exported
+// except a linker directive, and the loader answers a name or an ordinal from
+// that list and from nowhere else.
+//
+// `function` says which place the name's offset counts from, the way a
+// definition does: the code, or the storage of an object. `ordinal` is the
+// number the export answers to, and zero asks the table to assign one.
+pub struct Export {
+pub:
+	name     string
+	ordinal  int
+	function bool
+}
+
 // Definition is where a name that another translation unit of the same link
 // defines lives in the image being built: a function's offset in the code, or a
 // top-level object's offset in the writable data. The emitter cannot know it,
@@ -381,6 +396,11 @@ pub mut:
 	// and another names it, and a reference to it has to land on the bytes the
 	// definition wrote rather than on bytes of the same name.
 	read_only_globals map[string]GlobalSlot
+	// exports are the names this image offers to another image, in the order
+	// the input named them. A COFF object states them as linker directives
+	// rather than as symbols, so the list is what a PE writer reads; an ELF
+	// image has no such list and leaves it empty.
+	exports []Export
 	// sections are the unit's named sections, which a container that keeps
 	// section names places by that name rather than merging into a blob. A
 	// unit this compiler's emitter wrote has none, and every reference it left
