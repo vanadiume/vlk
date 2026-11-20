@@ -649,3 +649,116 @@ fn test_a_script_named_by_a_library_pulls_the_archives_it_names() {
 	}
 	assert status == 9
 }
+
+// The Windows lane end to end: two COFF objects a compiler wrote, read as units,
+// merged, wrapped as a PE image, and run. Nothing here is built by hand, so what
+// the test checks is the whole path a Windows build would take: the unwind data
+// the compiler wrote as sections of its own, the references inside it, the entry
+// the link resolves by name, and the status the program returns.
+fn test_two_coff_objects_link_and_run() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write COFF objects with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('coff')
+	os.mkdir_all(dir) or { panic(err) }
+	first := os.join_path(dir, 'add.c')
+	second := os.join_path(dir, 'main.c')
+	os.write_file(first, 'int add(int a, int b) { return a + b; }\n') or { panic(err) }
+	os.write_file(second, 'int add(int a, int b);\nint main(void) { return add(40, 2); }\n') or {
+		panic(err)
+	}
+	first_object := os.join_path(dir, 'add.obj')
+	second_object := os.join_path(dir, 'main.obj')
+	for pair in [[first, first_object], [second, second_object]] {
+		result := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', pair[0], '-o', pair[1]])
+		if result.exit_code != 0 {
+			eprintln('skipping: clang could not write a COFF object: ${result.output}')
+			return
+		}
+	}
+	image := os.join_path(dir, 'coff.exe')
+	report := link_files([first_object, second_object], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
+	assert report.units == 2
+	assert report.bytes > 0
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+}
+
+// An object that names the machine this reader does not know is refused before a
+// byte of it is placed.
+fn test_a_coff_object_for_another_machine_is_refused() {
+	dir := scratch('coff_machine')
+	os.mkdir_all(dir) or { panic(err) }
+	object := os.join_path(dir, 'unit.obj')
+	mut bytes := []u8{len: 40}
+	put_u16_at(mut bytes, 0, u16(0x014c)) // an i386 object
+	put_u16_at(mut bytes, 2, 0)
+	put_u16_at(mut bytes, 16, 0)
+	os.write_file_array(object, bytes) or { panic(err) }
+	link_files([object], Options{
+		target: target.windows_x86_64()
+		kind:   .program
+		output: os.join_path(dir, 'out.exe')
+	}) or {
+		// The input layer refuses it by path, because a COFF object for another
+		// machine is not a file this target can read.
+		assert err.msg().contains('unit.obj')
+		return
+	}
+	assert false, 'an i386 object has no place in a windows-x86_64 link'
+}
+
+fn put_u16_at(mut bytes []u8, at int, value u16) {
+	bytes[at] = u8(value & 0xff)
+	bytes[at + 1] = u8((value >> 8) & 0xff)
+}
+
+// A thread-local variable a compiler declared reaches the image through the same
+// path the hand-written test uses: the template in a section, the index the
+// loader hands out, and code that reads the TEB. The object leaves `_tls_index`
+// undefined because the image is what defines it, so the link supplies the name.
+fn test_a_thread_local_from_a_coff_object_is_read_from_the_thread_s_copy() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write a COFF object with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('coff_tls')
+	os.mkdir_all(dir) or { panic(err) }
+	source := os.join_path(dir, 'tls.c')
+	os.write_file(source, '__declspec(thread) int counter = 7;\nint main(void) { return counter; }\n') or {
+		panic(err)
+	}
+	object := os.join_path(dir, 'tls.obj')
+	result := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', source, '-o', object])
+	if result.exit_code != 0 {
+		eprintln('skipping: clang could not write the object: ${result.output}')
+		return
+	}
+	image := os.join_path(dir, 'tls.exe')
+	link_files([object], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
+	os.setenv('WINEDEBUG', '-all', true)
+	run := os.exec(['/usr/bin/wine', image])
+	assert run.exit_code == 7, 'wine left with ${run.exit_code}: ${run.output}'
+}
