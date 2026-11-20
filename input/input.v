@@ -116,6 +116,9 @@ pub:
 // cares about as paths.
 pub fn read(paths []string, libraries []string, library_dirs []string, static_link bool, groups []Group, machine target.Target) !Read {
 	mut out := Read{}
+	// The COMDAT groups the link has kept, shared by every input so that the
+	// first object carrying a group keeps it and the rest are discarded.
+	mut comdats := map[string]bool{}
 	mut provided := map[string]bool{}
 	mut needed := map[string]bool{}
 	dirs := library.search_dirs(library_dirs, machine.library_dirs)
@@ -123,13 +126,13 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
 		match classify(bytes, path)! {
 			.object, .coff_object {
-				part := read_object(bytes, machine) or { return error('${path}: ${err.msg()}') }
+				part := read_object(bytes, machine, mut comdats) or { return error('${path}: ${err.msg()}') }
 				note(mut provided, mut needed, part)
 				out.units << part
 			}
 			.archive {
 				parts := archive.read(bytes) or { return error('${path}: ${err.msg()}') }
-				members := pull(parts, path, machine, mut needed, mut provided)!
+				members := pull(parts, path, machine, mut needed, mut provided, mut comdats)!
 				out.pulled += members.len
 				out.units << members
 			}
@@ -156,7 +159,7 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 		for found in library.archive_libraries(libraries, dirs, static_link)! {
 			bytes := os.read_bytes(found.path) or { return error('${found.path}: ${err.msg()}') }
 			parts := archive.read(bytes) or { return error('${found.path}: ${err.msg()}') }
-			members := pull(parts, found.path, machine, mut needed, mut provided)!
+			members := pull(parts, found.path, machine, mut needed, mut provided, mut comdats)!
 			out.pulled += members.len
 			out.units << members
 		}
@@ -166,7 +169,8 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 	// the group answers, which is what the markers exist for. The sweeping stops
 	// when a whole pass over the group pulls nothing.
 	for group in groups {
-		read_group(group, dirs, static_link, machine, mut needed, mut provided, mut out)!
+		read_group(group, dirs, static_link, machine, mut needed, mut provided, mut out, mut
+			comdats)!
 	}
 	return out
 }
@@ -184,13 +188,13 @@ struct PendingGroupArchive {
 // the inputs outside it, so a name either side of the markers answers the other.
 // The paths and the -l names are read first, in their own order, and then the
 // archives are swept together until a pass pulls nothing.
-fn read_group(group Group, dirs []string, static_link bool, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut out Read) ! {
+fn read_group(group Group, dirs []string, static_link bool, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut out Read, mut comdats map[string]bool) ! {
 	mut pending := []PendingGroupArchive{}
 	for path in group.paths {
 		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
 		match classify(bytes, path)! {
 			.object, .coff_object {
-				part := read_object(bytes, machine) or { return error('${path}: ${err.msg()}') }
+				part := read_object(bytes, machine, mut comdats) or { return error('${path}: ${err.msg()}') }
 				note(mut provided, mut needed, part)
 				out.units << part
 			}
@@ -229,7 +233,7 @@ fn read_group(group Group, dirs []string, static_link bool, machine target.Targe
 			// remembers between passes.
 			mut entry := pending[index]
 			members := pull_members(entry.parts, entry.path, machine, mut entry.pulled, mut needed,
-				mut provided)!
+				mut provided, mut comdats)!
 			if members.len > 0 {
 				out.pulled += members.len
 				out.units << members
@@ -242,9 +246,9 @@ fn read_group(group Group, dirs []string, static_link bool, machine target.Targe
 // read_object reads one relocatable object, whichever container wrote it. The
 // bytes decide: an ELF object begins with the ELF magic and a COFF object begins
 // with its machine number, so the two cannot be mistaken for each other.
-fn read_object(bytes []u8, machine target.Target) !unit.Program {
+fn read_object(bytes []u8, machine target.Target, mut comdats map[string]bool) !unit.Program {
 	if coff.is_object(bytes) {
-		return coff.read_unit(bytes, machine)
+		return coff.read_unit_selecting(bytes, machine, mut comdats)
 	}
 	return object.read(bytes, machine)
 }
@@ -283,12 +287,13 @@ fn provided_with(mut provided map[string]bool, part unit.Program) {
 // rule ld follows and what keeps the C library's copy of a name the runtime's own
 // crt1.o already defines out of the link: two definitions of one name are what a
 // link refuses.
-fn pull(parts archive.Archive, path string, machine target.Target, mut needed map[string]bool, mut provided map[string]bool) ![]unit.Program {
+fn pull(parts archive.Archive, path string, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut comdats map[string]bool) ![]unit.Program {
 	mut out := []unit.Program{}
 	mut pulled := map[int]bool{}
 	mut again := true
 	for again {
-		members := pull_members(parts, path, machine, mut pulled, mut needed, mut provided)!
+		members := pull_members(parts, path, machine, mut pulled, mut needed, mut provided, mut
+			comdats)!
 		if members.len == 0 {
 			again = false
 		} else {
@@ -302,7 +307,7 @@ fn pull(parts archive.Archive, path string, machine target.Target, mut needed ma
 // needs and whose index has not been given up yet. The caller decides whether to
 // sweep the archive again, which is what `pull` does for one archive and what a
 // group does for all of its archives together.
-fn pull_members(parts archive.Archive, path string, machine target.Target, mut pulled map[int]bool, mut needed map[string]bool, mut provided map[string]bool) ![]unit.Program {
+fn pull_members(parts archive.Archive, path string, machine target.Target, mut pulled map[int]bool, mut needed map[string]bool, mut provided map[string]bool, mut comdats map[string]bool) ![]unit.Program {
 	mut out := []unit.Program{}
 	mut names := parts.index.keys()
 	names.sort()
@@ -316,7 +321,7 @@ fn pull_members(parts archive.Archive, path string, machine target.Target, mut p
 		}
 		pulled[index] = true
 		member := parts.members[index]
-		part := read_object(member.bytes, machine) or {
+		part := read_object(member.bytes, machine, mut comdats) or {
 			return error('${path}: ${member.name}: ${err.msg()}')
 		}
 		note(mut provided, mut needed, part)

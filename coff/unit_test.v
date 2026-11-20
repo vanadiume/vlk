@@ -106,3 +106,31 @@ fn test_the_addend_a_field_holds_is_read_back_out_of_it() {
 	}
 	assert found, 'the call to add is a reference the unit has to carry'
 }
+
+// A COMDAT group the link already kept is discarded whole on the next read: its
+// bytes never reach a blob and its symbol never reaches the merge, because the
+// copy the link kept is what another object's reference binds to by name.
+fn test_a_comdat_group_already_kept_is_discarded() {
+	dir := scratch()
+	path := compiling(dir, 'literal', 'const char *message(void) { return "shared literal"; }\n') or {
+		return
+	}
+	bytes := os.read_bytes(path) or { panic(err) }
+	mut selected := map[string]bool{}
+	first := read_unit_selecting(bytes, windows(), mut selected)!
+	second := read_unit_selecting(bytes, windows(), mut selected)!
+	assert first.string_blob.len > 0
+	assert first.read_only_globals.len > 0
+	// The literal was the object's only read-only contribution, so the second
+	// read carries none of it and defines no name from it.
+	assert second.string_blob.len == 0
+	assert second.read_only_globals.len == 0
+	// The code is still there, and its reference keeps the literal's name.
+	mut named := 0
+	for relocation in second.relocations {
+		if relocation.name.starts_with('??_C@') {
+			named++
+		}
+	}
+	assert named > 0
+}

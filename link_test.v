@@ -896,3 +896,50 @@ fn test_a_resource_a_resource_compiler_wrote_is_found_by_the_loader() {
 	result := os.exec(['/usr/bin/wine', image])
 	assert result.exit_code == 8, 'wine left with ${result.exit_code}: ${result.output}'
 }
+
+// A COMDAT group is one copy of one thing. Both objects here hold the same string
+// literal, and clang puts every literal in a group named after its content, so
+// the two objects carry the same group and the same symbol name. The link keeps
+// the first copy and the second object's reference binds to it, which is what
+// makes ordinary C code with a shared literal link at all.
+fn test_a_comdat_group_two_objects_carry_is_kept_once() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write COFF objects with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('comdat')
+	os.mkdir_all(dir) or { panic(err) }
+	first := os.join_path(dir, 'first.c')
+	second := os.join_path(dir, 'second.c')
+	os.write_file(first, 'const char *first(void) { return "shared literal"; }\n') or {
+		panic(err)
+	}
+	os.write_file(second, 'extern const char *first(void);\nint main(void) {\n    const char *mine = "shared literal";\n    return mine[0] == first()[0] ? 42 : 1;\n}\n') or {
+		panic(err)
+	}
+	first_object := os.join_path(dir, 'first.obj')
+	second_object := os.join_path(dir, 'second.obj')
+	for pair in [[first, first_object], [second, second_object]] {
+		result := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', pair[0], '-o', pair[1]])
+		if result.exit_code != 0 {
+			eprintln('skipping: clang could not write a COFF object: ${result.output}')
+			return
+		}
+	}
+	image := os.join_path(dir, 'comdat.exe')
+	report := link_files([first_object, second_object], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
+	assert report.units == 2
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+}

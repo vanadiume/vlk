@@ -64,11 +64,23 @@ mut:
 
 // read_unit turns one COFF object into the unit a link merges.
 pub fn read_unit(bytes []u8, machine target.Target) !unit.Program {
+	mut selected := map[string]bool{}
+	return read_unit_selecting(bytes, machine, mut selected)
+}
+
+// read_unit_selecting is the same read with the COMDAT groups the link has
+// already kept. A group named here is discarded whole: its bytes, its symbols and
+// the references inside it, because the copy the link kept is the one another
+// object's references bind to by name.
+//
+// The set is the caller's, because selection is a fact about a link and not about
+// one object: an object read on its own cannot know what another one carried.
+pub fn read_unit_selecting(bytes []u8, machine target.Target, mut selected map[string]bool) !unit.Program {
 	file := read(bytes)!
 	if machine.coff_machine != 0 && file.machine != machine.coff_machine {
 		return error('the object is for machine ${file.machine} and the link is for ${machine.name}')
 	}
-	placed := place(file)!
+	placed := place(file, mut selected)!
 	mut program := unit.Program{
 		text:                placed.text
 		string_blob:         placed.read_only
@@ -110,7 +122,7 @@ pub fn read_unit(bytes []u8, machine target.Target) !unit.Program {
 // directive or a table the writer of the object used, is dropped; a section this
 // reader has no rule for is refused by name rather than placed somewhere it
 // would be read wrong.
-fn place(file File) !Placement {
+fn place(file File, mut selected map[string]bool) !Placement {
 	mut placed := Placement{
 		part: []Part{len: file.sections.len, init: .none}
 		base: []int{len: file.sections.len}
@@ -119,6 +131,24 @@ fn place(file File) !Placement {
 	for i, section in file.sections {
 		if section.name == '' {
 			continue
+		}
+		// A COMDAT group is one copy of one thing, and the first object that
+		// carries it keeps it. The rest are discarded here, before their bytes
+		// reach a blob or their symbols reach the merge, which is the only
+		// point where a whole section can leave without rebuilding the unit.
+		group := comdat_of(file, section)
+		if group != '' {
+			if section.comdat_selection == comdat_no_duplicates && group in selected {
+				return error('the COMDAT group ${group} is carried twice and its selection forbids a duplicate')
+			}
+			if section.comdat_selection != comdat_any
+				&& section.comdat_selection != comdat_no_duplicates {
+				return error('section ${section.name} is COMDAT group ${group} with selection ${section.comdat_selection}, and this link selects only ANY and NODUPLICATES groups')
+			}
+			if group in selected {
+				continue
+			}
+			selected[group] = true
 		}
 		base_name := section.name.all_before('$')
 		alignment := section.alignment()
@@ -476,7 +506,16 @@ fn reference_of(file File, placed Placement, symbol Symbol) !Reference {
 			}
 		}
 		.none {
-			return error('symbol ${symbol.name} lies in a section this link does not place')
+			// A symbol whose section the link discarded is a name the copy the
+			// link kept defines, so the reference keeps the name and the merge
+			// binds it there. A section symbol has no such name: a section that
+			// is not placed has no address to point at.
+			if symbol.is_section_symbol() {
+				return error('symbol ${symbol.name} names a section this link discarded, and a section a link does not place has no address')
+			}
+			return Reference{
+				name: symbol.name
+			}
 		}
 	}
 }
