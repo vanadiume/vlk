@@ -7,6 +7,8 @@
 /build
 *.o
 *.a
+# `v run tools/gate.vsh` leaves the compiled script beside it.
+/tools/gate
 
 # Agent working state. Plans, probes and notes for one run live here and are
 # never committed.

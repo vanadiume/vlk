@@ -1098,3 +1098,148 @@ fn test_a_library_an_object_asks_for_is_found_beside_it() {
 	result := os.exec(['/usr/bin/wine', image])
 	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
 }
+
+// `/INCLUDE:name` is an object asking for a member of a library that nothing in
+// the link refers to. The entry point is the clearest witness: here the entry
+// lives only in the archive, so the image can be built at all only because the
+// directive pulled that member in. The same link without the directive is
+// refused, which is what makes the first one mean something.
+fn test_a_forced_include_pulls_an_entry_out_of_an_archive() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write a COFF object with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('forced')
+	os.mkdir_all(dir) or { panic(err) }
+	asker := os.join_path(dir, 'asker.c')
+	os.write_file(asker, '#pragma comment(linker, "/include:_start")\nint unused(void) { return 1; }\n') or {
+		panic(err)
+	}
+	member := os.join_path(dir, 'start.c')
+	os.write_file(member, 'void ExitProcess(unsigned int code);\nvoid _start(void) { ExitProcess(42); }\n') or {
+		panic(err)
+	}
+	for source in [asker, member] {
+		object := source.replace('.c', '.obj')
+		written := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', source, '-o', object])
+		if written.exit_code != 0 {
+			eprintln('skipping: clang could not write the object: ${written.output}')
+			return
+		}
+	}
+	bytes := os.read_bytes(os.join_path(dir, 'start.obj')) or { panic(err) }
+	lib := os.join_path(dir, 'start.lib')
+	os.write_file_array(lib, archive_of('start', bytes, ['_start'])) or { panic(err) }
+	kernel := os.join_path(dir, 'kernel32.lib')
+	os.write_file_array(kernel, import_library('ExitProcess', 'kernel32.dll',
+		'ExitProcess')) or { panic(err) }
+	image := os.join_path(dir, 'forced.exe')
+	link_files([os.join_path(dir, 'asker.obj'), lib, kernel], Options{
+		entry:  '_start'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+	// The same link without the directive has nothing to supply the entry from,
+	// so it fails rather than writing an image with no code in it.
+	plain := os.join_path(dir, 'plain.c')
+	os.write_file(plain, 'int unused(void) { return 1; }\n') or { panic(err) }
+	plain_object := os.join_path(dir, 'plain.obj')
+	written := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', plain, '-o', plain_object])
+	if written.exit_code != 0 {
+		return
+	}
+	link_files([plain_object, lib, kernel], Options{
+		entry:  '_start'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: os.join_path(dir, 'plain.exe')
+	}) or {
+		assert err.msg().contains('_start'), 'the refusal names the entry: ${err.msg()}'
+		return
+	}
+	assert false, 'a link whose entry only the archive defines was built without the directive'
+}
+
+// A section-relative field is what a debug record and a static thread-local use,
+// and clang writes one for `sym@secrel32`. The number it must hold is the
+// target's offset from the first byte of its own section, so the check is not
+// against this tree's own idea of it: the same object is linked by lld-link and
+// the two images must carry the same four bytes at the same field.
+fn test_a_section_relative_field_agrees_with_lld_link() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) || !os.exists('/usr/bin/lld-link') {
+		eprintln('skipping: this test compares against clang and lld-link, and one of them is absent')
+		return
+	}
+	dir := scratch('secrel')
+	os.mkdir_all(dir) or { panic(err) }
+	source := os.join_path(dir, 'secrel.s')
+	os.write_file(source, '\t.text\n\t.globl\ttarget\n\tnop\n\tnop\ntarget:\n\tret\n\t.section\t.rdata,"dr"\n\t.globl\tfields\nfields:\n\t.long\ttarget@secrel32\n') or {
+		panic(err)
+	}
+	object := os.join_path(dir, 'secrel.obj')
+	written := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', source, '-o', object])
+	if written.exit_code != 0 {
+		eprintln('skipping: clang could not assemble the object: ${written.output}')
+		return
+	}
+	with_lld := os.join_path(dir, 'lld.exe')
+	linked := os.exec(['/usr/bin/lld-link', '/entry:target', '/subsystem:console', '/nodefaultlib',
+		'/out:${with_lld}', object])
+	assert linked.exit_code == 0, 'lld-link refused the object: ${linked.output}'
+	ours := os.join_path(dir, 'vlk.exe')
+	link_files([object], Options{
+		entry:  'target'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: ours
+	})!
+	theirs := os.read_bytes(with_lld) or { panic(err) }
+	mine := os.read_bytes(ours) or { panic(err) }
+	their_field := section_field(theirs, '.rdata')
+	my_field := section_field(mine, '.rdata')
+	assert their_field > 0 && my_field > 0, 'both images must have a .rdata section'
+	// The target sits two bytes into the code, so the number is two.
+	assert u32_in(theirs, their_field) == 2, 'lld_link wrote ${u32_in(theirs, their_field)}'
+	assert u32_in(mine, my_field) == u32_in(theirs, their_field), 'the two images disagree: ${u32_in(mine, my_field)} and ${u32_in(theirs, their_field)}'
+}
+
+// section_field is the file offset of the first byte of a section's contents.
+fn section_field(image []u8, name string) int {
+	// The PE signature's offset is at 0x3c, and the COFF header follows it.
+	header := int(u32_in(image, 0x3c)) + 4
+	count := int(u16_in(image, header + 2))
+	table := header + 20 + int(u16_in(image, header + 16))
+	for i := 0; i < count; i++ {
+		at := table + i * 40
+		mut same := true
+		for j, c in name.bytes() {
+			if j >= 8 || image[at + j] != c {
+				same = false
+				break
+			}
+		}
+		if same {
+			return int(u32_in(image, at + 20))
+		}
+	}
+	return -1
+}
+
+fn u16_in(bytes []u8, at int) u16 {
+	return u16(bytes[at]) | (u16(bytes[at + 1]) << 8)
+}
+
+fn u32_in(bytes []u8, at int) u32 {
+	return u32(bytes[at]) | (u32(bytes[at + 1]) << 8) | (u32(bytes[at + 2]) << 16) |
+		(u32(bytes[at + 3]) << 24)
+}

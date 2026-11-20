@@ -134,3 +134,142 @@ fn test_a_comdat_group_already_kept_is_discarded() {
 	}
 	assert named > 0
 }
+
+// A relocation in a test object: where the field is, which symbol it names and
+// the AMD64 type, which is the part a compiler's own output rarely carries.
+struct TestReloc {
+	offset u32
+	symbol u32
+	kind   u16
+}
+
+// object_u32 and object_u16 append a little-endian number to a byte array, which
+// is how every field of a COFF file is written.
+fn object_u32(mut out []u8, value u32) {
+	for i in 0 .. 4 {
+		out << u8((value >> (8 * i)) & 0xff)
+	}
+}
+
+fn object_u16(mut out []u8, value u16) {
+	for i in 0 .. 2 {
+		out << u8((value >> (8 * i)) & 0xff)
+	}
+}
+
+// object_name writes an eight-byte name, which is all a short name needs and all
+// the table holds without a string-table offset.
+fn object_name(mut out []u8, name string) {
+	mut field := []u8{len: 8, init: u8(0)}
+	for i, c in name.bytes() {
+		field[i] = c
+	}
+	out << field
+}
+
+// object_section writes one section header.
+fn object_section(mut out []u8, name string, size int, at int, relocs_at int, count int, characteristics u32) {
+	object_name(mut out, name)
+	object_u32(mut out, 0)
+	object_u32(mut out, 0)
+	object_u32(mut out, u32(size))
+	object_u32(mut out, u32(at))
+	object_u32(mut out, u32(if count > 0 { relocs_at } else { 0 }))
+	object_u32(mut out, 0)
+	object_u16(mut out, u16(count))
+	object_u16(mut out, 0)
+	object_u32(mut out, characteristics)
+}
+
+// object_symbol writes one symbol table record: a name, a value, the section it
+// is in, its type, and its storage class.
+fn object_symbol(mut out []u8, name string, value u32, section u16, kind u16, class u8) {
+	object_name(mut out, name)
+	object_u32(mut out, value)
+	object_u16(mut out, section)
+	object_u16(mut out, kind)
+	out << class
+	out << u8(0)
+}
+
+// build_object_with writes the smallest object that carries the relocation
+// types under test: two sections, a symbol inside the code, and one relocation
+// table per section. The reader's arithmetic is checked against types nothing on
+// this machine emits, so the object is written here rather than compiled.
+fn build_object_with(text_relocs []TestReloc, rodata_relocs []TestReloc) []u8 {
+	text := []u8{len: 16, init: u8(0x90)}
+	rodata := []u8{len: 8, init: u8(0xcc)}
+	mut out := []u8{}
+	text_at := 20 + 2 * 40
+	rodata_at := text_at + text.len
+	text_reloc_at := rodata_at + rodata.len
+	rodata_reloc_at := text_reloc_at + text_relocs.len * 10
+	symtab_at := rodata_reloc_at + rodata_relocs.len * 10
+	object_u16(mut out, 0x8664)
+	object_u16(mut out, 2)
+	object_u32(mut out, 0)
+	object_u32(mut out, u32(symtab_at))
+	object_u32(mut out, 3)
+	object_u16(mut out, 0)
+	object_u16(mut out, 0)
+	object_section(mut out, '.text', text.len, text_at, text_reloc_at, text_relocs.len,
+		0x60000020)
+	object_section(mut out, '.rdata', rodata.len, rodata_at, rodata_reloc_at,
+		rodata_relocs.len, 0x40000040)
+	out << text
+	out << rodata
+	for table in [text_relocs, rodata_relocs] {
+		for relocation in table {
+			object_u32(mut out, relocation.offset)
+			object_u32(mut out, relocation.symbol)
+			object_u16(mut out, relocation.kind)
+		}
+	}
+	// Symbol 0 is a name inside the code, and 1 and 2 are the section symbols
+	// the reader needs to know where each section went.
+	object_symbol(mut out, 'target', 8, 1, 0x20, 2)
+	object_symbol(mut out, '.text', 0, 1, 0, 3)
+	object_symbol(mut out, '.rdata', 0, 2, 0, 3)
+	object_u32(mut out, 4)
+	return out
+}
+
+// Every type this shell reads is one a link needs and a compiler does not write:
+// a section index, a section offset, a seven-bit section offset, and a
+// span-dependent displacement with the pair entry that marks it.
+fn test_the_section_relative_and_span_types_are_read() {
+	bytes := build_object_with([TestReloc{ offset: 0, symbol: 0, kind: 0x0e }], [
+		TestReloc{ offset: 0, symbol: 2, kind: 0x0a },
+		TestReloc{ offset: 2, symbol: 2, kind: 0x0b },
+		TestReloc{ offset: 6, symbol: 2, kind: 0x0c },
+	])
+	mut selected := map[string]bool{}
+	program := read_unit_selecting(bytes, windows(), mut selected) or {
+		panic('the reader refused an object carrying the section-relative types: ${err.msg()}')
+	}
+	assert program.relocations.len == 4, 'a pair entry takes no field and the other four do: ${program.relocations.len}'
+	span := program.relocations[0]
+	assert span.kind == unit.RelocationKind.span
+	assert span.addend == -4
+	section_index := program.relocations[1]
+	assert section_index.kind == unit.RelocationKind.section_index
+	assert section_index.width == unit.RelocationWidth.halfword
+	secrel := program.relocations[2]
+	assert secrel.kind == unit.RelocationKind.secrel
+	assert secrel.width == unit.RelocationWidth.narrow
+	secrel7 := program.relocations[3]
+	assert secrel7.kind == unit.RelocationKind.secrel7
+	assert secrel7.width == unit.RelocationWidth.octet
+}
+
+// A pair entry with nothing above it is a file whose relocations were not
+// written the way the format says, and it is named rather than ignored.
+fn test_a_pair_with_nothing_to_pair_with_is_refused() {
+	bytes := build_object_with([TestReloc{ offset: 0, symbol: 0, kind: 0x0f }], [])
+	mut selected := map[string]bool{}
+	if _ := read_unit_selecting(bytes, windows(), mut selected) {
+		assert false, 'the reader accepted a PAIR entry that follows no span-dependent relocation'
+	} else {
+		assert err.msg().contains('PAIR'), err.msg()
+	}
+}

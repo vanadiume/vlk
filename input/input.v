@@ -126,6 +126,10 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 	mut provided := map[string]bool{}
 	mut needed := map[string]bool{}
 	dirs := library.search_dirs(library_dirs, machine.library_dirs)
+	// The objects are read before the archives, whatever order the command line
+	// gave them in: an archive is swept for the names the objects ask for, and a
+	// name an object forces in with `/INCLUDE:` is one of them, so a file that
+	// answers must be swept after the files that ask.
 	for path in paths {
 		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
 		match classify(bytes, path)! {
@@ -135,11 +139,7 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 				out.units << part
 			}
 			.archive {
-				parts := archive.read(bytes) or { return error('${path}: ${err.msg()}') }
-				members := pull(parts, path, machine, mut needed, mut provided, mut comdats, mut
-					import_libraries)!
-				out.pulled += members.len
-				out.units << members
+				// Swept below, once every object has been read.
 			}
 			.library {
 				found := library.shared_library(path) or {
@@ -148,6 +148,26 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 				out.shared << found
 			}
 		}
+	}
+	// An object can force a name into the link with `/INCLUDE:`, which is how a
+	// `#pragma comment(linker, "/include:...")` reaches a linker. The name joins
+	// the set the archives are swept for, so the member that defines it is
+	// pulled even though no reference asks for it.
+	for part in out.units {
+		for name in part.include_symbols {
+			needed[name] = true
+		}
+	}
+	for path in paths {
+		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
+		if classify(bytes, path)! != .archive {
+			continue
+		}
+		parts := archive.read(bytes) or { return error('${path}: ${err.msg()}') }
+		members := pull(parts, path, machine, mut needed, mut provided, mut comdats, mut
+			import_libraries)!
+		out.pulled += members.len
+		out.units << members
 	}
 	// A `-l` name that resolved to a static archive is read the way a path that
 	// names one is, and so is an archive a GNU ld script names beside its

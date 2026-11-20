@@ -140,6 +140,10 @@ pub:
 
 // RelocationWidth is how many bytes of the field a reference occupies.
 pub enum RelocationWidth {
+	// octet is one byte, which a seven-bit section offset is written into.
+	octet
+	// halfword is two bytes, which a section index is.
+	halfword
 	narrow
 	wide
 }
@@ -180,6 +184,22 @@ pub enum RelocationKind {
 	// distance from a section or a thread pointer, so no base or block base is
 	// part of it.
 	tls_offset
+	// section_index writes the number of the image section the target lies in,
+	// which a debug record pairs with a section-relative offset to name a place
+	// without depending on where the section landed.
+	section_index
+	// secrel writes the target's offset from the first byte of its own section.
+	// Static thread-local storage reads it: the number is where the variable
+	// lies in the block the loader copies for each thread.
+	secrel
+	// secrel7 is the same offset in seven bits, written into a byte whose high
+	// bit belongs to whatever the byte also carries.
+	secrel7
+	// span writes a displacement the assembler left for the link to compute,
+	// in an instruction whose width is already final. The field holds no
+	// addend: what the object wrote there is a provisional distance, and the
+	// link replaces it rather than adding to it.
+	span
 }
 
 // Import is one name an image needs from a library, with the library the object
@@ -370,6 +390,11 @@ pub mut:
 	// follows; the merge never needs them, and a program a caller builds has
 	// none.
 	default_libraries []string
+	// include_symbols are the names an object forced into the link with
+	// `/INCLUDE:`, which is how a `#pragma comment(linker, "/include:...")`
+	// reaches a linker. A forced name is read before the archives are swept, so
+	// the member that defines it is pulled even though nothing refers to it.
+	include_symbols []string
 	// object_imports are the names in `imports` that name an object rather than
 	// a function: an `extern` object another translation unit defines. The
 	// symbol is undefined either way, and the type it is given says what a

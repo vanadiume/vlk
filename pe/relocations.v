@@ -46,7 +46,12 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 		index := layout.index(section_name) or {
 			return error('a relocation names ${section_name} and the image has no such section')
 		}
-		width := if relocation.width == .wide { 8 } else { 4 }
+		width := match relocation.width {
+			.octet { 1 }
+			.halfword { 2 }
+			.narrow { 4 }
+			.wide { 8 }
+		}
 		size := layout.sections[index].virtual_size
 		if relocation.offset < 0 || relocation.offset + width > size {
 			return error("a relocation at ${relocation.offset} in ${section_name} does not lie inside the section's ${size} bytes")
@@ -64,6 +69,66 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 				return error('the thread-local offset of ${relocation.name} is ${value}, which a four-byte field does not hold')
 			}
 			put_u32(mut layout.sections[index].data, relocation.offset, u32(value & 0xffffffff))
+			continue
+		}
+		// A section-relative reference names a place inside a section rather
+		// than an address in the image: the number is where the target lies
+		// from that section's first byte. A section that moves carries the
+		// number with it, so nothing here is a base relocation site.
+		if relocation.kind == .section_index {
+			// An absolute symbol has no section, and the toolchain this format
+			// comes from answers a record that names one with the number past
+			// the last section.
+			mut number := 0
+			if relocation.name == '' {
+				number = layout.sections.len + 1
+			} else {
+				where := reference(program, layout, plan, tls, relocation.name)!
+				number = section_holding(layout, where)! + 1
+			}
+			value := i64(number) + relocation.addend
+			if value < 0 || value > 0xffff {
+				return error('the section index of ${relocation.name} is ${value}, which a two-byte field does not hold')
+			}
+			put_u16(mut layout.sections[index].data, relocation.offset, u16(value))
+			continue
+		}
+		if relocation.kind == .secrel || relocation.kind == .secrel7 {
+			// A thread-local is answered from the unit's own labels: its
+			// section is the block the loader copies per thread, and the
+			// number is where the variable lies in that copy.
+			mut value := 0
+			mut absolute := false
+			if relocation.name in program.tls_labels {
+				value = program.tls_labels[relocation.name] + relocation.addend
+			} else {
+				if relocation.name == '' {
+					absolute = true
+				} else {
+					where := reference(program, layout, plan, tls, relocation.name)!
+					base := layout.sections[section_holding(layout, where)!].rva
+					value = where + relocation.addend - base
+				}
+			}
+			if absolute {
+				// A debug record is the one place this shape is met with an
+				// absolute target, and there the offset is left as it was.
+				continue
+			}
+			if relocation.kind == .secrel7 {
+				if value < 0 || value > 127 {
+					return error('the section offset of ${relocation.name} is ${value}, which seven bits do not hold')
+				}
+				// The high bit of the byte belongs to what else the byte
+				// carries, so only the low seven are written.
+				kept := layout.sections[index].data[relocation.offset] & 0x80
+				layout.sections[index].data[relocation.offset] = kept | u8(value)
+				continue
+			}
+			if value < 0 || value > 4294967295 {
+				return error('the section offset of ${relocation.name} is ${value}, which a four-byte field does not hold')
+			}
+			put_u32(mut layout.sections[index].data, relocation.offset, u32(value))
 			continue
 		}
 		mut place := reference(program, layout, plan, tls, relocation.name)!
@@ -108,10 +173,18 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 			.tpoff {
 				return error('a thread pointer offset reference to ${relocation.name} is left for a later version, which places thread-local storage')
 			}
-			.tls_offset {
+			.tls_offset, .secrel, .secrel7, .section_index {
 				// Answered above, before the name is looked up as an address;
-				// this arm only completes the match.
+				// these arms only complete the match.
 				0
+			}
+			.span {
+				// The displacement runs from the end of the field, and the
+				// instruction is already its final width: this link computes
+				// the number but does not relax the instruction, so an object
+				// that left a short form for the link to grow has no reading
+				// here.
+				i64(place) + relocation.addend - field
 			}
 		}
 		if width == 4 {
@@ -137,6 +210,18 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 		}
 	}
 	return sites
+}
+
+// section_holding is the index of the image section an address lies in. A
+// section-relative reference is answered against the section its target is in,
+// and an address no section holds has no such number.
+fn section_holding(layout Layout, address int) !int {
+	for i, section in layout.sections {
+		if address >= section.rva && address < section.rva + section.virtual_size {
+			return i
+		}
+	}
+	return error('${address} lies in no section of this image, and a section-relative reference names one that does')
 }
 
 // apply_fixups rewrites the instructions a unit's emitter left unfinished. A

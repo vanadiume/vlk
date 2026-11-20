@@ -1852,6 +1852,9 @@ fn patch(mut output []u8, program unit.Program, machine target.Target, sections 
 		field := relocation_section(sections, relocation.place) + relocation.offset
 		value := relocation_value(program, sections, base, extra, field, relocation)!
 		match relocation.width {
+			.octet, .halfword {
+				return error('${relocation.name} occupies a field of one or two bytes, which is the shape a COFF object carries and not an ELF reference')
+			}
 			.narrow { put_u32(mut output, field, u32(i32(value))) }
 			.wide { put_u64(mut output, field, u64(value)) }
 		}
@@ -2039,6 +2042,12 @@ fn relocation_value(program unit.Program, sections Sections, base u64, extra []s
 		}
 		.tls_offset {
 			return error("${relocation.name} is written as an offset into a thread's thread-local copy, which is a Windows image's number")
+		}
+		.section_index, .secrel, .secrel7 {
+			return error('${relocation.name} is written as a section-relative number, which is the shape a COFF object carries and an ELF image has no form of')
+		}
+		.span {
+			return error('${relocation.name} is written as a span-dependent displacement, which only a PE object leaves to its link')
 		}
 	}
 }

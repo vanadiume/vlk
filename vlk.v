@@ -271,6 +271,25 @@ pub fn merge(units []unit.Program, options Options) !Merged {
 			imports_by_library << record
 		}
 	}
+	// A name an object forced in with `/INCLUDE:` is a name the link was told to
+	// carry, so a link that cannot carry it is an error rather than a link that
+	// quietly leaves it out: nothing refers to a forced name, so nothing else
+	// would report it missing. A name an import library answers counts as
+	// carried, because the image names the DLL and the loader supplies it.
+	mut answered := map[string]bool{}
+	for record in imports_by_library {
+		answered[record.name] = true
+		if record.symbol != '' {
+			answered[record.symbol] = true
+		}
+	}
+	for part in units {
+		for name in part.include_symbols {
+			if name !in names.defined && name !in names.imports && name !in answered {
+				return error('${name} was forced into the link and nothing among the inputs defines it')
+			}
+		}
+	}
 	labels := merge_labels(units, layout, names.definitions)
 	place_of_entry := entry_place_of(units, layout, labels, options.entry)
 	mut merged := unit.Program{

@@ -290,15 +290,27 @@ fn read_directives(file File, mut program unit.Program) ! {
 			if option == '' {
 				continue
 			}
-			if option.starts_with('/DEFAULTLIB:') {
-				name := option.all_after('/DEFAULTLIB:').trim('"')
+			// The option's spelling is not the spelling of what it names: a
+			// directive reads the same in any case, while a symbol keeps its
+			// own, so the option is compared lowered and the name cut from the
+			// text the object wrote.
+			lowered := option.to_lower()
+			if lowered.starts_with('/defaultlib:') {
+				name := option.all_after(':').trim('"')
 				if name != '' && name !in program.default_libraries {
 					program.default_libraries << name
 				}
 				continue
 			}
-			if option.starts_with('/EXPORT:') {
-				name := option.all_after('/EXPORT:').all_before(',')
+			if lowered.starts_with('/include:') {
+				name := option.all_after(':').trim('"')
+				if name != '' && name !in program.include_symbols {
+					program.include_symbols << name
+				}
+				continue
+			}
+			if lowered.starts_with('/export:') {
+				name := option.all_after(':').all_before(',')
 				if name != '' {
 					program.exports << unit.Export{
 						name: name
@@ -397,7 +409,25 @@ fn read_unit_symbols(file File, placed Placement, mut program unit.Program) ! {
 // names the section rather than a symbol, which is how `.pdata` points at
 // `.text`: the section's own name and the byte inside it.
 fn read_object_relocations(file File, placed Placement, mut program unit.Program) ! {
+	// A PAIR entry marks the entry above it as a span-dependent value, and takes
+	// no field of its own. It is checked against the entry it follows rather than
+	// dropped silently, because a pair with nothing to pair with is a file whose
+	// relocations were not read the way its writer wrote them.
+	mut previous_section := u16(0)
+	mut previous_offset := u32(0)
+	mut previous_kind := u16(0)
 	for relocation in file.relocations {
+		if relocation.kind == rel_amd64_pair {
+			paired := previous_kind == rel_amd64_srel32 || previous_kind == rel_amd64_sspan32
+			if !paired || relocation.section != previous_section
+				|| relocation.offset != previous_offset {
+				return error('a PAIR entry in section ${relocation.section} at ${relocation.offset} follows no span-dependent relocation at that offset')
+			}
+			continue
+		}
+		previous_section = relocation.section
+		previous_offset = relocation.offset
+		previous_kind = relocation.kind
 		if relocation.section < 1 || relocation.section > file.sections.len {
 			continue
 		}
@@ -412,9 +442,15 @@ fn read_object_relocations(file File, placed Placement, mut program unit.Program
 		width := field_width_of(relocation.kind) or {
 			return error('a relocation in ${file.sections[i].name} is type ${relocation.kind}, which this reader does not carry')
 		}
-		stored := field_addend(file, file.sections[i], relocation.offset, width)
-		reference := reference_of(file, placed, symbol)!
 		form := relocation_kind_of(relocation.kind)!
+		// A span-dependent field holds a provisional distance rather than an
+		// addend, so what the object wrote there is replaced, not added to.
+		stored := if form.kind == .span {
+			0
+		} else {
+			field_addend(file, file.sections[i], relocation.offset, width)
+		}
+		reference := reference_of(file, placed, symbol)!
 		mut field_place := unit.RelocationPlace.text
 		mut named_section := ''
 		match part {
@@ -430,13 +466,20 @@ fn read_object_relocations(file File, placed Placement, mut program unit.Program
 			}
 			.none {}
 		}
+		// A seven-bit field shares its byte with whatever else the byte carries,
+		// so only the low seven bits are the offset the field holds now.
+		addend := if form.kind == .secrel7 {
+			(stored & 0x7f) + reference.addend + form.extra
+		} else {
+			stored + reference.addend + form.extra
+		}
 		program.relocations << unit.Relocation{
 			offset:  relocation.offset
 			place:   field_place
 			section: named_section
 			kind:    form.kind
 			name:    reference.name
-			addend:  stored + reference.addend + form.extra
+			addend:  addend
 			width:   width
 		}
 	}
@@ -547,12 +590,19 @@ fn relocation_kind_of(kind u16) !RelocationForm {
 		rel_amd64_rel32_3 { RelocationForm{unit.RelocationKind.direct, -7} }
 		rel_amd64_rel32_4 { RelocationForm{unit.RelocationKind.direct, -8} }
 		rel_amd64_rel32_5 { RelocationForm{unit.RelocationKind.direct, -9} }
-		// A section-relative field is how the code names a thread-local: the
-		// number is the variable's offset inside one thread's copy, which is
-		// what the unit's thread-local labels already hold.
-		rel_amd64_secrel, rel_amd64_secrel7 { RelocationForm{unit.RelocationKind.tls_offset, 0} }
+		// A section-relative field names a place by its offset from the first
+		// byte of its own section. Static thread-local storage uses it, where
+		// the section is the thread-local block; debug records use it with a
+		// section index to describe a place without naming where the section
+		// landed.
+		rel_amd64_secrel { RelocationForm{unit.RelocationKind.secrel, 0} }
+		rel_amd64_secrel7 { RelocationForm{unit.RelocationKind.secrel7, 0} }
+		rel_amd64_section { RelocationForm{unit.RelocationKind.section_index, 0} }
+		// A span-dependent displacement is measured from the end of its field,
+		// the way a relative reference is.
+		rel_amd64_srel32, rel_amd64_sspan32 { RelocationForm{unit.RelocationKind.span, -4} }
 		else {
-			return error('relocation type ${kind} is one a span-dependent or section-relative entry uses, and this reader carries neither')
+			return error('relocation type ${kind} is a pair marker or one this reader has no arithmetic for')
 		}
 	}
 }
@@ -562,9 +612,11 @@ fn relocation_kind_of(kind u16) !RelocationForm {
 fn field_width_of(kind u16) ?unit.RelocationWidth {
 	return match kind {
 		rel_amd64_addr64 { unit.RelocationWidth.wide }
+		rel_amd64_section { unit.RelocationWidth.halfword }
+		rel_amd64_secrel7 { unit.RelocationWidth.octet }
 		rel_amd64_addr32, rel_amd64_addr32nb, rel_amd64_rel32, rel_amd64_rel32_1,
 		rel_amd64_rel32_2, rel_amd64_rel32_3, rel_amd64_rel32_4, rel_amd64_rel32_5,
-		rel_amd64_secrel, rel_amd64_secrel7 {
+		rel_amd64_secrel, rel_amd64_srel32, rel_amd64_sspan32 {
 			unit.RelocationWidth.narrow
 		}
 		else {
@@ -578,7 +630,12 @@ fn field_width_of(kind u16) ?unit.RelocationWidth {
 // the section is refused rather than read from the next one.
 fn field_addend(file File, section Section, offset u32, width unit.RelocationWidth) int {
 	data := file.data(section)
-	size := if width == .wide { 8 } else { 4 }
+	size := match width {
+		.octet { 1 }
+		.halfword { 2 }
+		.narrow { 4 }
+		.wide { 8 }
+	}
 	if int(offset) + size > data.len {
 		return 0
 	}

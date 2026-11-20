@@ -765,3 +765,106 @@ fn test_an_export_the_image_does_not_define_is_refused() {
 		assert err.msg().contains('missing')
 	}
 }
+
+// A section-relative field names a place inside a section rather than an address
+// in the image, and a span-dependent field holds a displacement the assembler
+// left for the link. Neither changes when the image is mapped somewhere else, so
+// neither is a base relocation site. The numbers here are read out of the image
+// the way a debugger reads them: the section's index, the byte's offset from the
+// section's first byte, and the distance to the label.
+fn test_section_relative_and_span_fields_are_written_against_their_sections() {
+	windows := target.windows_x86_64()
+	mut part := unit.Program{}
+	part.text = [
+		u8(0xe8),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call inner
+		u8(0xc3), // ret, the entry
+		u8(0xcc),
+		u8(0xcc), // padding to the label
+		u8(0xc3), // inner: ret
+	]
+	part.labels['main'] = 0
+	part.labels['inner'] = 8
+	part.defined['main'] = true
+	part.defined['inner'] = true
+	part.entry_place = 0
+	part.sections << unit.Section{
+		name:      '.rdataf'
+		data:      [u8(0), u8(0), u8(0), u8(0), u8(0), u8(0), u8(0x80)]
+		alignment: 4
+		kind:      .read_only
+	}
+	part.relocations << unit.Relocation{
+		offset: 1
+		place:  .text
+		kind:   .span
+		name:   'inner'
+		addend: -4
+		width:  .narrow
+	}
+	part.relocations << unit.Relocation{
+		offset:  0
+		place:   .section
+		section: '.rdataf'
+		kind:    .section_index
+		name:    'inner'
+		width:   .halfword
+	}
+	part.relocations << unit.Relocation{
+		offset:  2
+		place:   .section
+		section: '.rdataf'
+		kind:    .secrel
+		name:    'inner'
+		width:   .narrow
+	}
+	part.relocations << unit.Relocation{
+		offset:  6
+		place:   .section
+		section: '.rdataf'
+		kind:    .secrel7
+		name:    'inner'
+		width:   .octet
+	}
+	image := write(part, windows, .executable)!
+	// The code is the first section, so the label at offset 8 is 0x1008 and the
+	// field at offset 1 is 0x1001: eight plus the distance from the end of the
+	// field is three.
+	span := i32(u32_at(image, raw_offset(image, 0x1001)))
+	assert span == 3, 'the span field says ${span}'
+	// The named section is placed after the blobs, so its address is read from
+	// the section table rather than assumed.
+	named := section_rva(image, '.rdataf')
+	at := raw_offset(image, named)
+	assert section_rva(image, '.text') == 0x1000
+	assert int(u16_at(image, at)) == 1, 'the section index of the code is 1'
+	assert int(u32_at(image, at + 2)) == 8, 'the offset inside the code is 8'
+	assert image[at + 6] == u8(0x88), 'the seven-bit offset keeps the byte high bit: ${image[at + 6]}'
+}
+
+// section_rva reads one section's address out of the section table, by name.
+fn section_rva(image []u8, name string) int {
+	sections := u16_at(image, pe_header_offset + 4 + 2)
+	table := pe_header_offset + 4 + coff_header_size + int(u16_at(image, pe_header_offset + 4 + 16))
+	for i in 0 .. int(sections) {
+		at := table + i * section_header_size
+		if name_in_row(image, at, name) {
+			return int(u32_at(image, at + 12))
+		}
+	}
+	return -1
+}
+
+// name_in_row compares a section header's eight-byte name with a string, which is
+// how a test finds a section the writer placed.
+fn name_in_row(image []u8, at int, name string) bool {
+	for i, c in name.bytes() {
+		if i >= 8 || image[at + i] != c {
+			return false
+		}
+	}
+	return true
+}
