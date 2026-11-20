@@ -1,6 +1,7 @@
 module output
 
 import vanadiume.vlk.elf
+import vanadiume.vlk.pe
 import vanadiume.vlk.target
 import vanadiume.vlk.unit
 
@@ -19,6 +20,26 @@ pub type Options = elf.Options
 // The program is the merge's answer and the target is the caller's, and nothing
 // here decides what the image holds: the layout, the tables and every reference
 // were settled before this call.
+//
+// Which writer runs is the target's answer. It is a dispatch here rather than a
+// branch inside either writer, because the two containers share nothing below
+// this line: an ELF image is segments and a PE image is sections, and a writer
+// that held both would be the worst file in the tree to read.
 pub fn image(program unit.Program, machine target.Target, kind Kind, options Options) ![]u8 {
-	return elf.write_options(program, machine, kind, options)
+	return match machine.format {
+		.elf { elf.write_options(program, machine, kind, options) }
+		.pe { pe.write(program, machine, pe_kind(kind)) }
+	}
+}
+
+// pe_kind is the depth a caller asked for, as the PE container names it. A
+// position-independent executable is an executable whose header says the loader
+// may move it, which is what the Windows target already asks for, and a static
+// program is an executable whose import directory is empty, which is a fact
+// about the program rather than another kind of header.
+fn pe_kind(kind Kind) pe.Kind {
+	return match kind {
+		.program, .static_program, .pie { pe.Kind.executable }
+		.shared { pe.Kind.dll }
+	}
 }
