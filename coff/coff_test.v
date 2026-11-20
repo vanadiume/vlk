@@ -16,19 +16,38 @@ struct TestSection {
 	characteristics u32
 }
 
-// build_object assembles a COFF object out of the sections it is given. The
-// parts stand in the order a compiler writes them: the header, the section
-// table, the section data, the relocations, the symbol table, the string table.
-fn build_object(sections []TestSection) []u8 {
-	// The string table first, because a long section name in the section
-	// table is an offset into it and that offset has to be known before the
-	// table is written.
+// TestSymbol is one symbol table entry and the auxiliary records that belong to
+// it. aux is raw, because which record it is depends on the symbol.
+struct TestSymbol {
+	name    string
+	value   u32
+	section i16
+	kind    u16
+	class   u8
+	aux     []u8
+}
+
+// build_object assembles a COFF object out of the sections and symbols it is
+// given. The parts stand in the order a compiler writes them: the header, the
+// section table, the section data, the relocations, the symbol table, the string
+// table.
+fn build_object(sections []TestSection, symbols []TestSymbol) []u8 {
+	// The string table first, because a long name in the section table or in
+	// the symbol table is an offset into it and that offset has to be known
+	// before either table is written.
 	mut strings := []u8{len: 4}
 	mut name_offsets := map[string]int{}
 	for section in sections {
 		if section.name.len > 8 && section.name !in name_offsets {
 			name_offsets[section.name] = strings.len
 			strings << section.name.bytes()
+			strings << u8(0)
+		}
+	}
+	for symbol in symbols {
+		if symbol.name.len > 8 && symbol.name !in name_offsets {
+			name_offsets[symbol.name] = strings.len
+			strings << symbol.name.bytes()
 			strings << u8(0)
 		}
 	}
@@ -39,19 +58,28 @@ fn build_object(sections []TestSection) []u8 {
 	for section in sections {
 		data_size += section.data.len
 	}
-	total := coff_header_size + sections.len * section_header_size + data_size + strings.len
+	mut aux_size := 0
+	for symbol in symbols {
+		aux_size += symbol.aux.len
+	}
+	symbol_entries := symbols.len + aux_size / symbol_entry_size
+	symbol_offset := coff_header_size + sections.len * section_header_size + data_size
+	string_offset := symbol_offset + symbol_entries * symbol_entry_size
+	total := string_offset + strings.len
 	mut bytes := []u8{len: total, init: u8(0)}
-	// The header. SymbolCount stays zero, so the string table is read as
-	// absent by a reader that decides from the pointer, and this builder's
-	// sections carry no long name of their own in that case.
 	put_u16(mut bytes, 0, image_file_machine_amd64)
 	put_u16(mut bytes, 2, u16(sections.len))
+	if symbol_entries > 0 {
+		put_u32(mut bytes, 8, u32(symbol_offset))
+		put_u32(mut bytes, 12, u32(symbol_entries))
+	}
 	put_u16(mut bytes, 16, 0)
-	mut at := coff_header_size + sections.len * section_header_size
 	mut offsets := []int{cap: sections.len}
+	at := coff_header_size + sections.len * section_header_size
+	mut next := at
 	for section in sections {
-		offsets << at
-		at += section.data.len
+		offsets << next
+		next += section.data.len
 	}
 	for i, section in sections {
 		header := coff_header_size + i * section_header_size
@@ -63,17 +91,45 @@ fn build_object(sections []TestSection) []u8 {
 			bytes[offsets[i] + j] = byte
 		}
 	}
+	mut symbol_at := symbol_offset
+	for symbol in symbols {
+		write_symbol_name(mut bytes, symbol_at, symbol.name, name_offsets)
+		put_u32(mut bytes, symbol_at + 8, symbol.value)
+		put_u16(mut bytes, symbol_at + 12, u16(i32(symbol.section) & 0xffff))
+		put_u16(mut bytes, symbol_at + 14, symbol.kind)
+		bytes[symbol_at + 16] = symbol.class
+		bytes[symbol_at + 17] = u8(symbol.aux.len / symbol_entry_size)
+		for j, byte in symbol.aux {
+			bytes[symbol_at + symbol_entry_size + j] = byte
+		}
+		symbol_at += symbol_entry_size + symbol.aux.len
+	}
+	for j, byte in strings {
+		bytes[string_offset + j] = byte
+	}
 	return bytes
 }
 
-// write_name writes an eight-byte name field: the text when it fits, and a slash
-// and the string table offset when it does not.
+// write_name writes an eight-byte section name field: the text when it fits, and
+// a slash and the string table offset when it does not.
 fn write_name(mut bytes []u8, at int, name string, offsets map[string]int) {
 	if name.len > 8 {
 		text := '/${offsets[name]}'
 		for i, byte in text.bytes() {
 			bytes[at + i] = byte
 		}
+		return
+	}
+	for i, byte in name.bytes() {
+		bytes[at + i] = byte
+	}
+}
+
+// write_symbol_name writes an eight-byte symbol name field: the text when it
+// fits, and four zero bytes and the string table offset when it does not.
+fn write_symbol_name(mut bytes []u8, at int, name string, offsets map[string]int) {
+	if name.len > 8 {
+		put_u32(mut bytes, at + 4, u32(offsets[name]))
 		return
 	}
 	for i, byte in name.bytes() {
@@ -100,8 +156,25 @@ fn text_section(name string) TestSection {
 	}
 }
 
+// section_symbol is the static symbol every section carries at value zero. Its
+// auxiliary record is where a COMDAT group's selection is written.
+fn section_symbol(name string, section int, selection u8, number int) TestSymbol {
+	mut aux := []u8{len: symbol_entry_size}
+	put_u32(mut aux, 0, 3)
+	put_u16(mut aux, 12, u16(number))
+	aux[14] = selection
+	return TestSymbol{
+		name:    name
+		value:   0
+		section: i16(section)
+		kind:    0
+		class:   sym_class_static
+		aux:     aux
+	}
+}
+
 fn test_a_section_is_read_with_its_name_and_bytes() {
-	object := build_object([text_section('.text')])
+	object := build_object([text_section('.text')], [])
 	file := read(object)!
 	assert file.machine == image_file_machine_amd64
 	assert file.sections.len == 1
@@ -123,7 +196,7 @@ fn test_a_name_that_fills_all_eight_bytes_is_read_whole() {
 			characteristics: scn_cnt_initialized_data | scn_mem_discardable | scn_lnk_info
 		},
 		text_section('.text'),
-	])
+	], [])
 	file := read(object)!
 	assert file.sections.len == 2
 	assert file.sections[0].name == '.debug$S'
@@ -139,10 +212,190 @@ fn test_a_section_with_no_bytes_has_none() {
 			data:            []u8{}
 			characteristics: scn_cnt_uninitialized_data | scn_mem_read | scn_mem_write
 		},
-	])
+	], [])
 	file := read(object)!
 	assert file.sections[0].raw_size == 0
 	assert file.data(file.sections[0]).len == 0
+}
+
+fn test_symbols_are_read_with_their_sections_and_classes() {
+	object := build_object([
+		text_section('.text'),
+		TestSection{
+			name:            '.data'
+			data:            [u8(0), u8(0), u8(0), u8(0)]
+			characteristics: scn_cnt_initialized_data | scn_mem_read | scn_mem_write
+		},
+	], [
+		section_symbol('.text', 1, comdat_none, 1),
+		TestSymbol{
+			name:    'main'
+			value:   0
+			section: 1
+			kind:    sym_type_function
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+		TestSymbol{
+			name:    'counter'
+			value:   8
+			section: 2
+			kind:    0
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+		TestSymbol{
+			name:    'puts'
+			value:   0
+			section: 0
+			kind:    sym_type_function
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	file := read(object)!
+	assert file.symbols.len == 4
+	assert file.symbols[0].name == '.text'
+	assert file.symbols[0].is_section_symbol()
+	assert !file.symbols[0].is_undefined()
+	assert file.symbols[1].name == 'main'
+	assert file.symbols[1].is_function()
+	assert file.symbols[1].section == 1
+	assert file.symbols[1].storage_class == sym_class_external
+	assert file.symbols[2].name == 'counter'
+	assert !file.symbols[2].is_function()
+	assert file.symbols[3].name == 'puts'
+	assert file.symbols[3].is_undefined()
+	assert !file.symbols[3].is_common()
+}
+
+fn test_an_auxiliary_record_belongs_to_the_symbol_before_it() {
+	object := build_object([
+		TestSection{
+			name:            '.rdata'
+			data:            [u8(1), u8(2), u8(3)]
+			characteristics: scn_cnt_initialized_data | scn_mem_read | scn_lnk_comdat
+		},
+	], [
+		section_symbol('.rdata', 1, comdat_any, 1),
+		TestSymbol{
+			name:    '??_C@_03@abc@'
+			value:   0
+			section: 1
+			kind:    0
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	file := read(object)!
+	// The section symbol's auxiliary record is not a symbol of its own, so
+	// the table holds the section symbol and the COMDAT symbol, no more.
+	assert file.symbols.len == 2
+	assert file.symbols[0].aux_count == 1
+	assert file.symbols[1].index == 2
+	definition := file.symbols[0].section_definition() or {
+		assert false, 'the section symbol carries its auxiliary record'
+		return
+	}
+	assert definition.selection == comdat_any
+	assert definition.number == 1
+	assert file.sections[0].comdat_selection == comdat_any
+	assert file.sections[0].is_comdat()
+}
+
+fn test_an_associative_section_names_the_one_it_follows() {
+	object := build_object([
+		TestSection{
+			name:            '.text$mn'
+			data:            [u8(0x90)]
+			characteristics: scn_cnt_code | scn_mem_execute | scn_lnk_comdat
+		},
+		TestSection{
+			name:            '.text$unlikely'
+			data:            [u8(0xc3)]
+			characteristics: scn_cnt_code | scn_mem_execute | scn_lnk_comdat
+		},
+	], [
+		section_symbol('.text$mn', 1, comdat_any, 1),
+		section_symbol('.text$unlikely', 2, comdat_associative, 1),
+	])
+	file := read(object)!
+	assert file.sections[0].comdat_selection == comdat_any
+	assert file.sections[1].comdat_selection == comdat_associative
+	assert file.sections[1].associative == 1
+}
+
+fn test_a_long_name_is_read_out_of_the_string_table() {
+	object := build_object([
+		TestSection{
+			name:            '.llvm_addrsig'
+			data:            [u8(0)]
+			characteristics: scn_lnk_remove
+		},
+	], [
+		TestSymbol{
+			name:    'a_very_long_symbol_name'
+			value:   0
+			section: 1
+			kind:    0
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	file := read(object)!
+	assert file.sections[0].name == '.llvm_addrsig'
+	assert file.symbols[0].name == 'a_very_long_symbol_name'
+}
+
+fn test_a_common_symbol_is_told_apart_from_an_undefined_one() {
+	object := build_object([text_section('.text')], [
+		TestSymbol{
+			name:    'shared'
+			value:   16
+			section: 0
+			kind:    0
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+		TestSymbol{
+			name:    'wanted'
+			value:   0
+			section: 0
+			kind:    sym_type_function
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	file := read(object)!
+	assert file.symbols[0].is_common()
+	assert !file.symbols[0].is_undefined()
+	assert file.symbols[1].is_undefined()
+	assert !file.symbols[1].is_common()
+}
+
+fn test_a_weak_external_names_the_symbol_it_falls_back_to() {
+	mut aux := []u8{len: symbol_entry_size}
+	put_u32(mut aux, 0, 7)
+	put_u32(mut aux, 4, weak_extern_alias)
+	object := build_object([text_section('.text')], [
+		TestSymbol{
+			name:    'optional'
+			value:   0
+			section: 0
+			kind:    0
+			class:   sym_class_weak_external
+			aux:     aux
+		},
+	])
+	file := read(object)!
+	assert file.symbols.len == 1
+	assert file.symbols[0].storage_class == sym_class_weak_external
+	weak := file.symbols[0].weak_external() or {
+		assert false, 'a weak external carries its fallback record'
+		return
+	}
+	assert weak.tag_index == 7
+	assert weak.characteristics == weak_extern_alias
 }
 
 fn test_a_truncated_file_is_refused() {
@@ -151,16 +404,45 @@ fn test_a_truncated_file_is_refused() {
 	} else {
 		assert err.msg().contains('truncated')
 	}
-	object := build_object([text_section('.text')])
+	object := build_object([text_section('.text')], [])
 	if _ := read(object[..30]) {
 		assert false, 'a cut section table is not a readable object'
 	} else {
 		assert err.msg().contains('section table ends at')
 	}
+	symbols := build_object([text_section('.text')], [
+		section_symbol('.text', 1, comdat_none, 1),
+	])
+	mut lying := symbols.clone()
+	put_u32(mut lying, 12, 3)
+	if _ := read(lying) {
+		assert false, 'a symbol count past the table is not readable'
+	} else {
+		assert err.msg().contains('truncated')
+	}
+	mut overrun := build_object([text_section('.text')], [
+		TestSymbol{
+			name:    'main'
+			value:   0
+			section: 1
+			kind:    sym_type_function
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	// The symbol table starts where the section data ends. The one entry
+	// claims an auxiliary record its table does not hold, which is the shape
+	// a walk has to refuse rather than step past.
+	overrun[coff_header_size + section_header_size + 3 + 17] = u8(1)
+	if _ := read(overrun) {
+		assert false, 'auxiliary records past the table are not readable'
+	} else {
+		assert err.msg().contains('auxiliary records')
+	}
 }
 
 fn test_a_file_that_is_not_an_object_is_refused_by_what_it_is() {
-	mut image := build_object([text_section('.text')])
+	mut image := build_object([text_section('.text')], [])
 	image[0] = u8(0x4c)
 	image[1] = u8(0x01)
 	if _ := read(image) {
@@ -168,7 +450,7 @@ fn test_a_file_that_is_not_an_object_is_refused_by_what_it_is() {
 	} else {
 		assert err.msg().contains('i386')
 	}
-	mut with_header := build_object([text_section('.text')])
+	mut with_header := build_object([text_section('.text')], [])
 	put_u16(mut with_header, 16, 224)
 	if _ := read(with_header) {
 		assert false, 'an image carries an optional header and is not an object'
@@ -212,4 +494,24 @@ fn test_an_object_a_compiler_wrote_is_read() {
 			assert section.characteristics & scn_mem_execute != 0
 		}
 	}
+	// Every section the compiler wrote carries its section symbol, whose
+	// auxiliary record the walk has to step over. A reader that treated one
+	// as a symbol would find more symbols than the file has names for.
+	mut defined := map[string]bool{}
+	for symbol in file.symbols {
+		if symbol.name != '' {
+			defined[symbol.name] = true
+		}
+	}
+	assert 'add' in defined
+	assert 'answer' in defined
+	mut add := Symbol{}
+	for symbol in file.symbols {
+		if symbol.name == 'add' {
+			add = symbol
+		}
+	}
+	assert add.is_function()
+	assert add.section > 0
+	assert add.value == 0
 }

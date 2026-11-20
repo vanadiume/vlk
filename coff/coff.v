@@ -63,11 +63,42 @@ pub const comdat_exact_match = u8(4)
 pub const comdat_associative = u8(5)
 pub const comdat_largest = u8(6)
 
+// The storage classes a link reads. A symbol is external whether it is defined
+// in this object or is a name the object needs, static when it is a section
+// symbol or a file-scope name, and weak external when a link may substitute
+// another symbol for it.
+pub const sym_class_external = u8(2)
+pub const sym_class_static = u8(3)
+pub const sym_class_function = u8(101)
+pub const sym_class_file = u8(103)
+pub const sym_class_section = u8(104)
+pub const sym_class_weak_external = u8(105)
+
+// sym_type_function is the high byte of a symbol's type when the symbol names a
+// function. Microsoft tools set it for every function and leave it clear for an
+// object, and a link reads it to know which of the two a reference reaches.
+pub const sym_type_function = u16(0x20)
+
+// The three section numbers that are not a section. Zero is a name this object
+// does not define, which is an import unless its value says how much storage it
+// wants; -1 is a constant, whose value is the constant; -2 is a debug record the
+// linker does not place.
+pub const section_number_undefined = 0
+pub const section_number_absolute = -1
+pub const section_number_debug = -2
+
+// The weak external characteristics: what happens when nothing defines the name,
+// which is to search no library, search the libraries, or use the alias the
+// symbol names.
+pub const weak_extern_search_nolibrary = u32(1)
+pub const weak_extern_search_library = u32(2)
+pub const weak_extern_alias = u32(3)
+
 // Section is one section header with its name resolved out of the string table
 // when the name did not fit in the eight bytes the header holds. The number is
 // one-based, the way a symbol's section field and a relocation name a section.
 pub struct Section {
-pub:
+pub mut:
 	number          int
 	name            string
 	virtual_size    u32
@@ -79,6 +110,139 @@ pub:
 	line_offset     int
 	line_count      int
 	characteristics u32
+	// comdat_selection is the value the section symbol's auxiliary record
+	// carries, and zero for a section that is not part of a COMDAT group.
+	comdat_selection u8
+	// associative is the number of the section an ASSOCIATIVE COMDAT member
+	// follows, and zero for every other selection.
+	associative int
+}
+
+// SectionDefinition is the auxiliary record a section symbol carries: how long
+// the section is, how many relocations and line numbers it holds, and, for a
+// COMDAT group, its selection.
+pub struct SectionDefinition {
+pub:
+	length           u32
+	relocation_count u16
+	line_count       u16
+	checksum         u32
+	number           u16
+	selection        u8
+}
+
+// FunctionDefinition is the auxiliary record an external function symbol
+// carries: the size of its code and where its debug records are.
+pub struct FunctionDefinition {
+pub:
+	tag_index     u32
+	total_size    u32
+	line_offset   u32
+	next_function u32
+}
+
+// WeakExternal is the auxiliary record a weak external carries: the symbol to
+// use when nothing defines this one, and what to search.
+pub struct WeakExternal {
+pub:
+	tag_index       u32
+	characteristics u32
+}
+
+// Symbol is one symbol table entry, with its name resolved. `index` is where the
+// entry stands in the table, which is what a relocation names and what an
+// auxiliary record's tag index counts from.
+pub struct Symbol {
+pub:
+	index         int
+	name          string
+	value         u32
+	section       int
+	kind          u16
+	storage_class u8
+	aux_count     int
+	// aux is the symbol's auxiliary records as the file holds them. Which
+	// record they are depends on what the symbol is, so they are read by the
+	// accessor that matches it rather than at parse time.
+	aux []u8
+}
+
+// section_definition is the auxiliary record of a section symbol, or none when
+// the symbol carries none. Every section symbol the format writes carries
+// exactly one.
+pub fn (s Symbol) section_definition() ?SectionDefinition {
+	if s.aux.len < symbol_entry_size {
+		return none
+	}
+	return SectionDefinition{
+		length:           read_u32(s.aux, 0) or { return none }
+		relocation_count: read_u16(s.aux, 4) or { return none }
+		line_count:       read_u16(s.aux, 6) or { return none }
+		checksum:         read_u32(s.aux, 8) or { return none }
+		number:           read_u16(s.aux, 12) or { return none }
+		selection:        s.aux[14]
+	}
+}
+
+// function_definition is the auxiliary record of a function symbol, or none when
+// the symbol carries none.
+pub fn (s Symbol) function_definition() ?FunctionDefinition {
+	if s.aux.len < symbol_entry_size {
+		return none
+	}
+	return FunctionDefinition{
+		tag_index:     read_u32(s.aux, 0) or { return none }
+		total_size:    read_u32(s.aux, 4) or { return none }
+		line_offset:   read_u32(s.aux, 8) or { return none }
+		next_function: read_u32(s.aux, 12) or { return none }
+	}
+}
+
+// weak_external is the auxiliary record of a weak external, or none when the
+// symbol carries none.
+pub fn (s Symbol) weak_external() ?WeakExternal {
+	if s.aux.len < symbol_entry_size {
+		return none
+	}
+	return WeakExternal{
+		tag_index:       read_u32(s.aux, 0) or { return none }
+		characteristics: read_u32(s.aux, 4) or { return none }
+	}
+}
+
+// is_undefined says the symbol is a name this object needs and does not define.
+// A common symbol is section zero as well, and it is not undefined: its value is
+// the storage the link has to make, so it is told apart by `is_common`.
+pub fn (s Symbol) is_undefined() bool {
+	return s.section == section_number_undefined && !s.is_common()
+}
+
+// is_common says the symbol is a tentative definition: section zero, external,
+// and a value that is the number of bytes the link has to place.
+pub fn (s Symbol) is_common() bool {
+	return s.section == section_number_undefined && s.storage_class == sym_class_external
+		&& s.value > 0
+}
+
+// is_section_symbol says the symbol names the start of its section rather than a
+// function or an object in it. A relocation against one addresses the section,
+// and its auxiliary record is where a COMDAT group's selection is written.
+pub fn (s Symbol) is_section_symbol() bool {
+	return s.storage_class == sym_class_static && s.value == 0
+		&& s.section > section_number_undefined
+}
+
+// is_function says the symbol names code rather than storage, which is what the
+// function bit of its type field states and what a link reads to know whether a
+// reference reaches a thunk or an address.
+pub fn (s Symbol) is_function() bool {
+	return (s.kind & sym_type_function) != 0
+}
+
+// is_absolute says the symbol is a constant: its value is the number a reference
+// to it stands for, and it has no storage in any section.
+pub fn (s Symbol) is_absolute() bool {
+	return s.section == section_number_absolute
 }
 
 // File is one read object: the header fields a link reads, the sections, the
@@ -94,6 +258,10 @@ pub:
 	characteristics u16
 	bytes           []u8
 	sections        []Section
+	// symbols holds the symbol table entries in file order, with auxiliary
+	// records folded into the symbol they belong to. The count is smaller
+	// than the header's NumberOfSymbols whenever a symbol carries aux data.
+	symbols []Symbol
 }
 
 // data is one section's bytes in the file. A section that holds uninitialized
@@ -175,12 +343,110 @@ pub fn read(bytes []u8) !File {
 	for i in 0 .. section_count {
 		sections << read_section(bytes, i, string_table)!
 	}
+	symbols := read_symbols(bytes, int(symbol_offset), symbol_count, string_table)!
+	apply_comdat(mut sections, symbols)
 	return File{
 		machine:         machine
 		time_date_stamp: time_date_stamp
 		characteristics: characteristics
 		bytes:           bytes
 		sections:        sections
+		symbols:         symbols
+	}
+}
+
+// read_symbols walks the symbol table, folding each symbol's auxiliary records
+// into it. An auxiliary record is not a symbol: it is the rest of the entry
+// before it, and a walk that stepped one entry at a time would hand a link a
+// symbol named after whatever bytes the record happened to hold.
+//
+// The stride is therefore variable, and the last auxiliary record has to end
+// inside the table. A count that runs past it is a malformed file and is refused
+// rather than clipped.
+fn read_symbols(bytes []u8, offset int, count int, string_table []u8) ![]Symbol {
+	if count == 0 {
+		return []Symbol{}
+	}
+	if offset == 0 {
+		return error('the file states ${count} symbols and names no symbol table')
+	}
+	if offset + count * symbol_entry_size > bytes.len {
+		return error('the symbol table ends at ${offset + count * symbol_entry_size} and the file is ${bytes.len} bytes')
+	}
+	mut symbols := []Symbol{cap: count}
+	mut i := 0
+	for i < count {
+		at := offset + i * symbol_entry_size
+		aux_count := int(bytes[at + 17])
+		if i + aux_count >= count {
+			return error('symbol ${i} says ${aux_count} auxiliary records follow and the table ends ${count - i - 1} entries after it')
+		}
+		aux_at := at + symbol_entry_size
+		symbols << Symbol{
+			index:         i
+			name:          symbol_name(bytes, at, string_table)!
+			value:         read_u32(bytes, at + 8)!
+			section:       int(read_i16(bytes, at + 12)!)
+			kind:          read_u16(bytes, at + 14)!
+			storage_class: bytes[at + 16]
+			aux_count:     aux_count
+			aux:           bytes[aux_at..aux_at + aux_count * symbol_entry_size]
+		}
+		i += 1 + aux_count
+	}
+	return symbols
+}
+
+// symbol_name is the name one table entry holds. A name of eight bytes or fewer
+// is in the entry; one with four leading zero bytes names an offset into the
+// string table, which is where every longer name lives.
+fn symbol_name(bytes []u8, at int, string_table []u8) !string {
+	if read_u32(bytes, at)! == 0 {
+		offset := int(read_u32(bytes, at + 4)!)
+		if string_table.len == 0 {
+			return error('the symbol at ${at} names a string and the object has no string table')
+		}
+		return named_offset(string_table, offset)
+	}
+	mut end := 0
+	for end < 8 && bytes[at + end] != u8(0) {
+		end++
+	}
+	return bytes[at..at + end].bytestr()
+}
+
+// named_offset reads a name at an offset into the string table. The first four
+// bytes of the table are its own size, so an offset below four names the size
+// field rather than a name and is refused.
+fn named_offset(string_table []u8, offset int) !string {
+	if offset < 4 {
+		return error("a name at string table offset ${offset} is inside the table's own size field")
+	}
+	return cstr(string_table, offset)
+}
+
+// apply_comdat reads each COMDAT section's selection out of its section symbol's
+// auxiliary record. The record is the only place the format writes the
+// selection, so a section table on its own says a section is a COMDAT member and
+// nothing more; which member wins a link is decided from here.
+fn apply_comdat(mut sections []Section, symbols []Symbol) {
+	for symbol in symbols {
+		if !symbol.is_section_symbol() || symbol.section > sections.len {
+			continue
+		}
+		mut section := sections[symbol.section - 1]
+		if section.name != symbol.name {
+			continue
+		}
+		definition := symbol.section_definition() or { continue }
+		if definition.selection == comdat_none {
+			continue
+		}
+		section.comdat_selection = definition.selection
+		if definition.selection == comdat_associative {
+			section.associative = int(definition.number)
+		}
+		sections[symbol.section - 1] = section
 	}
 }
 
@@ -332,6 +598,13 @@ fn read_u16(bytes []u8, at int) !u16 {
 		return error('a two-byte field at ${at} is outside the ${bytes.len} bytes of the file')
 	}
 	return u16(bytes[at]) | (u16(bytes[at + 1]) << 8)
+}
+
+// read_i16 is the same two bytes read as a signed number, which is what a
+// symbol's section field is: the negative values are the sections a file does
+// not have, not large section numbers.
+fn read_i16(bytes []u8, at int) !i16 {
+	return i16(read_u16(bytes, at)!)
 }
 
 fn read_u32(bytes []u8, at int) !u32 {
