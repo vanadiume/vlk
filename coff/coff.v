@@ -94,9 +94,120 @@ pub const weak_extern_search_nolibrary = u32(1)
 pub const weak_extern_search_library = u32(2)
 pub const weak_extern_alias = u32(3)
 
-// Section is one section header with its name resolved out of the string table
-// when the name did not fit in the eight bytes the header holds. The number is
-// one-based, the way a symbol's section field and a relocation name a section.
+// The AMD64 relocation types. A COFF field's addend is in the bytes it points
+// at, the way an ELF REL entry's is, so the number a type writes is a formula
+// over the symbol's address, the field's own place and what the field already
+// holds. The reader names them; applying them is a link's work.
+pub const rel_amd64_absolute = u16(0x0000)
+pub const rel_amd64_addr64 = u16(0x0001)
+pub const rel_amd64_addr32 = u16(0x0002)
+pub const rel_amd64_addr32nb = u16(0x0003)
+pub const rel_amd64_rel32 = u16(0x0004)
+pub const rel_amd64_rel32_1 = u16(0x0005)
+pub const rel_amd64_rel32_2 = u16(0x0006)
+pub const rel_amd64_rel32_3 = u16(0x0007)
+pub const rel_amd64_rel32_4 = u16(0x0008)
+pub const rel_amd64_rel32_5 = u16(0x0009)
+pub const rel_amd64_section = u16(0x000a)
+pub const rel_amd64_secrel = u16(0x000b)
+pub const rel_amd64_secrel7 = u16(0x000c)
+pub const rel_amd64_token = u16(0x000d)
+pub const rel_amd64_srel32 = u16(0x000e)
+pub const rel_amd64_pair = u16(0x000f)
+pub const rel_amd64_sspan32 = u16(0x0010)
+
+// Relocation is one 10-byte entry: where the field is, which symbol it names,
+// and how the number is written. `symbol` is the entry's symbol table index,
+// which counts auxiliary records, so it is looked up through `symbol_for`
+// rather than by indexing the symbols this reader folded them into.
+pub struct Relocation {
+pub:
+	section int
+	offset  u32
+	symbol  int
+	kind    u16
+}
+
+// relocations_of is one section's relocations in the order the file holds them.
+pub fn (f File) relocations_of(section int) []Relocation {
+	mut found := []Relocation{}
+	for relocation in f.relocations {
+		if relocation.section == section {
+			found << relocation
+		}
+	}
+	return found
+}
+
+// symbol_for is the symbol a relocation's index names. The symbols are in table
+// order and each carries the index it was found at, so a binary search answers
+// in logarithmic time; an index that names an auxiliary record rather than a
+// symbol is no symbol at all.
+pub fn (f File) symbol_for(index int) ?Symbol {
+	mut low := 0
+	mut high := f.symbols.len - 1
+	for low <= high {
+		middle := (low + high) / 2
+		if f.symbols[middle].index == index {
+			return f.symbols[middle]
+		}
+		if f.symbols[middle].index < index {
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	return none
+}
+
+// read_relocations walks every section's relocation array in section order. Each
+// entry's symbol index has to name a symbol rather than one of the auxiliary
+// records the index space also covers, and its type has to be one the AMD64
+// machine defines; a number past the last of them is a malformed file rather
+// than a type a later pass might learn.
+fn read_relocations(bytes []u8, sections []Section, symbol_count int, symbols []Symbol) ![]Relocation {
+	mut count := 0
+	for section in sections {
+		count += section.reloc_count
+	}
+	if count == 0 {
+		return []Relocation{}
+	}
+	// An auxiliary record occupies an index without being a symbol, so the
+	// indexes a relocation may name are the ones the symbol walk stopped at.
+	// A reference to any other index resolves to the middle of an entry.
+	mut is_symbol := []bool{len: symbol_count}
+	for symbol in symbols {
+		if symbol.index < symbol_count {
+			is_symbol[symbol.index] = true
+		}
+	}
+	mut relocations := []Relocation{cap: count}
+	for section in sections {
+		for i in 0 .. section.reloc_count {
+			entry := section.reloc_offset + i * relocation_entry_size
+			symbol := int(read_u32(bytes, entry + 4)!)
+			if symbol >= symbol_count {
+				return error('a relocation in section ${section.number} names symbol ${symbol} and the table has ${symbol_count} entries')
+			}
+			if !is_symbol[symbol] {
+				return error('a relocation in section ${section.number} names table index ${symbol}, which holds an auxiliary record rather than a symbol')
+			}
+			kind := read_u16(bytes, entry + 8)!
+			if kind > rel_amd64_sspan32 {
+				return error('a relocation in section ${section.number} is type ${kind}, and the AMD64 machine defines no type past ${rel_amd64_sspan32}')
+			}
+			relocations << Relocation{
+				section: section.number
+				offset:  read_u32(bytes, entry)!
+				symbol:  symbol
+				kind:    kind
+			}
+		}
+	}
+	return relocations
+}
+
 pub struct Section {
 pub mut:
 	number          int
@@ -262,6 +373,10 @@ pub:
 	// records folded into the symbol they belong to. The count is smaller
 	// than the header's NumberOfSymbols whenever a symbol carries aux data.
 	symbols []Symbol
+	// relocations is every section's relocation array, in section order and
+	// in the order each array holds. The section number is on each entry so
+	// the arrays stay one list a pass can walk once.
+	relocations []Relocation
 }
 
 // data is one section's bytes in the file. A section that holds uninitialized
@@ -345,6 +460,7 @@ pub fn read(bytes []u8) !File {
 	}
 	symbols := read_symbols(bytes, int(symbol_offset), symbol_count, string_table)!
 	apply_comdat(mut sections, symbols)
+	relocations := read_relocations(bytes, sections, symbol_count, symbols)!
 	return File{
 		machine:         machine
 		time_date_stamp: time_date_stamp
@@ -352,6 +468,7 @@ pub fn read(bytes []u8) !File {
 		bytes:           bytes
 		sections:        sections
 		symbols:         symbols
+		relocations:     relocations
 	}
 }
 
@@ -462,17 +579,28 @@ fn read_section(bytes []u8, index int, string_table []u8) !Section {
 		return error('section ${index + 1} ends at ${raw_offset + int(raw_size)} and the file is ${bytes.len} bytes')
 	}
 	reloc_offset := int(read_u32(bytes, at + 24)!)
-	reloc_count := int(read_u16(bytes, at + 32)!)
+	mut reloc_count := int(read_u16(bytes, at + 32)!)
 	line_offset := int(read_u32(bytes, at + 28)!)
 	characteristics := read_u32(bytes, at + 36)!
+	// The count saturates at 0xffff. When the overflow characteristic is
+	// set, the first relocation entry is a placeholder whose VirtualAddress
+	// field holds the true count, this placeholder included, and it is not a
+	// relocation itself. Skipping it here means the entries below are the
+	// section's actual references, and `reloc_offset` points at the first one.
+	mut first_reloc := reloc_offset
 	if reloc_count == int(relocation_overflow_count) && (characteristics & scn_lnk_nreloc_ovfl) != 0 {
-		return error('section ${index + 1} asks for the extended relocation count, which this reader does not read yet')
-	}
-	if reloc_count > 0 {
-		end := reloc_offset + reloc_count * relocation_entry_size
-		if end > bytes.len {
-			return error('the ${reloc_count} relocations of section ${index + 1} end at ${end} and the file is ${bytes.len} bytes')
+		if reloc_offset + relocation_entry_size > bytes.len {
+			return error('truncated file: the overflow count of section ${index + 1} is at ${reloc_offset} and the file is ${bytes.len} bytes')
 		}
+		stated := read_u32(bytes, reloc_offset)!
+		if stated < 1 {
+			return error('section ${index + 1} says its relocation count is ${stated}, and the placeholder entry counts itself')
+		}
+		reloc_count = int(stated) - 1
+		first_reloc = reloc_offset + relocation_entry_size
+	}
+	if first_reloc + reloc_count * relocation_entry_size > bytes.len {
+		return error('the ${reloc_count} relocations of section ${index + 1} end at ${first_reloc + reloc_count * relocation_entry_size} and the file is ${bytes.len} bytes')
 	}
 	return Section{
 		number:          index + 1
@@ -481,7 +609,7 @@ fn read_section(bytes []u8, index int, string_table []u8) !Section {
 		virtual_address: read_u32(bytes, at + 12)!
 		raw_size:        raw_size
 		raw_offset:      raw_offset
-		reloc_offset:    reloc_offset
+		reloc_offset:    first_reloc
 		reloc_count:     reloc_count
 		line_offset:     line_offset
 		line_count:      int(read_u16(bytes, at + 34)!)

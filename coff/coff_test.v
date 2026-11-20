@@ -14,6 +14,18 @@ struct TestSection {
 	name            string
 	data            []u8
 	characteristics u32
+	relocs          []TestReloc = []
+	// overflow asks the builder to write the extended relocation count: the
+	// header saturates at 0xffff and the true count goes in a placeholder
+	// entry at the front of the array.
+	overflow bool
+}
+
+// TestReloc is one relocation entry a section carries.
+struct TestReloc {
+	offset u32
+	symbol u32
+	kind   u16
 }
 
 // TestSymbol is one symbol table entry and the auxiliary records that belong to
@@ -62,8 +74,18 @@ fn build_object(sections []TestSection, symbols []TestSymbol) []u8 {
 	for symbol in symbols {
 		aux_size += symbol.aux.len
 	}
+	mut reloc_size := 0
+	for section in sections {
+		if section.relocs.len > 0 {
+			reloc_size += section.relocs.len * relocation_entry_size
+			if section.overflow {
+				reloc_size += relocation_entry_size
+			}
+		}
+	}
 	symbol_entries := symbols.len + aux_size / symbol_entry_size
-	symbol_offset := coff_header_size + sections.len * section_header_size + data_size
+	reloc_start := coff_header_size + sections.len * section_header_size + data_size
+	symbol_offset := reloc_start + reloc_size
 	string_offset := symbol_offset + symbol_entries * symbol_entry_size
 	total := string_offset + strings.len
 	mut bytes := []u8{len: total, init: u8(0)}
@@ -81,14 +103,51 @@ fn build_object(sections []TestSection, symbols []TestSymbol) []u8 {
 		offsets << next
 		next += section.data.len
 	}
+	mut reloc_offsets := []int{cap: sections.len}
+	mut reloc_at := reloc_start
+	for section in sections {
+		reloc_offsets << reloc_at
+		if section.relocs.len > 0 {
+			reloc_at += section.relocs.len * relocation_entry_size
+			if section.overflow {
+				reloc_at += relocation_entry_size
+			}
+		}
+	}
 	for i, section in sections {
 		header := coff_header_size + i * section_header_size
 		write_name(mut bytes, header, section.name, name_offsets)
 		put_u32(mut bytes, header + 16, u32(section.data.len))
 		put_u32(mut bytes, header + 20, u32(offsets[i]))
-		put_u32(mut bytes, header + 36, section.characteristics)
+		mut characteristics := section.characteristics
+		if section.relocs.len > 0 {
+			put_u32(mut bytes, header + 24, u32(reloc_offsets[i]))
+			if section.overflow {
+				put_u16(mut bytes, header + 32, relocation_overflow_count)
+				characteristics |= scn_lnk_nreloc_ovfl
+			} else {
+				put_u16(mut bytes, header + 32, u16(section.relocs.len))
+			}
+		}
+		put_u32(mut bytes, header + 36, characteristics)
 		for j, byte in section.data {
 			bytes[offsets[i] + j] = byte
+		}
+	}
+	for i, section in sections {
+		if section.relocs.len == 0 {
+			continue
+		}
+		mut at2 := reloc_offsets[i]
+		if section.overflow {
+			put_u32(mut bytes, at2, u32(section.relocs.len + 1))
+			at2 += relocation_entry_size
+		}
+		for reloc in section.relocs {
+			put_u32(mut bytes, at2, reloc.offset)
+			put_u32(mut bytes, at2 + 4, reloc.symbol)
+			put_u16(mut bytes, at2 + 8, reloc.kind)
+			at2 += relocation_entry_size
 		}
 	}
 	mut symbol_at := symbol_offset
@@ -398,6 +457,118 @@ fn test_a_weak_external_names_the_symbol_it_falls_back_to() {
 	assert weak.characteristics == weak_extern_alias
 }
 
+fn test_relocations_are_read_with_the_symbol_each_names() {
+	object := build_object([
+		TestSection{
+			name:            '.text'
+			data:            [u8(0xe8), 0, 0, 0, 0]
+			characteristics: scn_cnt_code | scn_mem_execute
+			relocs:          [TestReloc{ offset: 1, symbol: 2, kind: rel_amd64_rel32 }]
+		},
+		TestSection{
+			name:            '.pdata'
+			data:            [u8(0), 0, 0, 0, 0, 0, 0, 0]
+			characteristics: scn_cnt_initialized_data | scn_mem_read
+			relocs:          [
+				TestReloc{ offset: 0, symbol: 0, kind: rel_amd64_addr32nb },
+				TestReloc{ offset: 4, symbol: 2, kind: rel_amd64_addr32nb },
+			]
+		},
+	], [
+		section_symbol('.text', 1, comdat_none, 1),
+		section_symbol('.pdata', 2, comdat_none, 2),
+		TestSymbol{
+			name:    'func'
+			value:   0
+			section: 1
+			kind:    sym_type_function
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	file := read(object)!
+	assert file.relocations.len == 3
+	text := file.relocations_of(1)
+	assert text.len == 1
+	assert text[0].offset == 1
+	assert text[0].kind == rel_amd64_rel32
+	text_symbol := file.symbol_for(text[0].symbol) or { panic('the relocation names a symbol') }
+	assert text_symbol.name == '.pdata'
+	pdata := file.relocations_of(2)
+	assert pdata.len == 2
+	assert pdata[0].offset == 0
+	assert pdata[0].kind == rel_amd64_addr32nb
+	first := file.symbol_for(pdata[0].symbol) or { panic('the relocation names a symbol') }
+	second := file.symbol_for(pdata[1].symbol) or { panic('the relocation names a symbol') }
+	assert first.name == '.text'
+	assert second.name == '.pdata'
+	assert file.relocations_of(3).len == 0
+}
+
+fn test_the_extended_relocation_count_is_read_past_its_placeholder() {
+	object := build_object([
+		TestSection{
+			name:            '.text'
+			data:            [u8(0xe8), 0, 0, 0, 0]
+			characteristics: scn_cnt_code | scn_mem_execute
+			relocs:          [TestReloc{ offset: 1, symbol: 2, kind: rel_amd64_rel32 }]
+			overflow:        true
+		},
+	], [
+		section_symbol('.text', 1, comdat_none, 1),
+		TestSymbol{
+			name:    'func'
+			value:   0
+			section: 1
+			kind:    sym_type_function
+			class:   sym_class_external
+			aux:     []u8{}
+		},
+	])
+	file := read(object)!
+	assert file.sections[0].reloc_count == 1
+	assert file.relocations.len == 1
+	assert file.relocations[0].offset == 1
+	target := file.symbol_for(file.relocations[0].symbol) or { panic('the relocation names a symbol') }
+	assert target.name == 'func'
+}
+
+fn test_a_relocation_that_names_an_auxiliary_record_is_refused() {
+	object := build_object([
+		TestSection{
+			name:            '.text'
+			data:            [u8(0xe8), 0, 0, 0, 0]
+			characteristics: scn_cnt_code | scn_mem_execute
+			relocs:          [TestReloc{ offset: 1, symbol: 1, kind: rel_amd64_rel32 }]
+		},
+	], [
+		section_symbol('.text', 1, comdat_none, 1),
+	])
+	if _ := read(object) {
+		assert false, 'index one holds the section symbol auxiliary record'
+	} else {
+		assert err.msg().contains('auxiliary record')
+	}
+}
+
+fn test_a_relocation_type_past_the_machine_s_is_refused() {
+	object := build_object([
+		TestSection{
+			name:            '.text'
+			data:            [u8(0xe8), 0, 0, 0, 0]
+			characteristics: scn_cnt_code | scn_mem_execute
+			relocs:          [TestReloc{ offset: 1, symbol: 0, kind: 0x11 }]
+		},
+	], [
+		section_symbol('.text', 1, comdat_none, 1),
+	])
+	if _ := read(object) {
+		assert false, 'type 0x11 is past the last type the machine defines'
+	} else {
+		assert err.msg().contains('no type past')
+	}
+}
+
 fn test_a_truncated_file_is_refused() {
 	if _ := read([]u8{len: 10}) {
 		assert false, 'ten bytes is not a COFF header'
@@ -514,4 +685,21 @@ fn test_an_object_a_compiler_wrote_is_read() {
 	assert add.is_function()
 	assert add.section > 0
 	assert add.value == 0
+	// The function adds the global to its arguments, so its code carries a
+	// reference the object could not settle. A reader that walked the
+	// section's relocation array agrees with that reference by name.
+	mut code := 0
+	for section in file.sections {
+		if section.name == '.text' {
+			code = section.number
+		}
+	}
+	assert code > 0
+	mut named := []string{}
+	for relocation in file.relocations_of(code) {
+		if symbol := file.symbol_for(relocation.symbol) {
+			named << symbol.name
+		}
+	}
+	assert 'answer' in named
 }
