@@ -178,20 +178,109 @@ fn u16_at(bytes []u8, at int) u16 {
 	return u16(bytes[at]) | (u16(bytes[at + 1]) << 8)
 }
 
-fn test_a_thread_local_program_is_refused_by_size() {
-	mut part := returning()
-	part.tls_size = 8
-	if _ := write(part, target.windows_x86_64(), .executable) {
-		assert false, 'a program with thread-local storage has no image from this writer'
-	} else {
-		assert err.msg().contains('thread-local storage')
+// Thread-local storage is the one place a PE image tells the loader to make a
+// copy per thread. The image holds the template, a four-byte slot for the index
+// the loader hands out, and a directory naming both; the code reads the index,
+// walks the thread's own array out of the TEB, and exits with the value it found.
+// Running it is the whole check: an index the loader never wrote, or a template
+// it never copied, leaves a status that is not the one the template holds.
+fn test_a_thread_local_value_is_read_out_of_the_thread_s_copy() {
+	windows := target.windows_x86_64()
+	mut part := unit.Program{}
+	part.text = [
+		u8(0x8b),
+		u8(0x05),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // mov eax, [rip + _tls_index]
+		u8(0x65),
+		u8(0x48),
+		u8(0x8b),
+		u8(0x0c),
+		u8(0x25),
+		u8(0x58),
+		u8(0),
+		u8(0),
+		u8(0), // mov rcx, gs:[0x58]
+		u8(0x48),
+		u8(0x8b),
+		u8(0x0c),
+		u8(0xc1), // mov rcx, [rcx + rax*8]
+		u8(0x8b),
+		u8(0x01), // mov eax, [rcx]
+		u8(0x89),
+		u8(0xc1), // mov ecx, eax
+		u8(0x48),
+		u8(0x83),
+		u8(0xec),
+		u8(0x28), // sub rsp, 0x28
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + 0]
+		u8(0x48),
+		u8(0x83),
+		u8(0xc4),
+		u8(0x28),
+		u8(0xc3),
+	]
+	part.tls_blob = [u8(7), u8(0), u8(0), u8(0)]
+	part.tls_size = 4
+	part.tls_alignment = 4
+	part.labels['main'] = 0
+	part.defined['main'] = true
+	part.entry_place = 0
+	part.imports << 'ExitProcess'
+	part.imports_by_library << unit.Import{
+		name:    'ExitProcess'
+		library: 'kernel32.dll'
 	}
+	part.relocations << unit.Relocation{
+		offset: 2
+		place:  .text
+		kind:   .direct
+		name:   '_tls_index'
+		addend: -4
+		width:  .narrow
+	}
+	part.relocations << unit.Relocation{
+		offset: 29
+		place:  .text
+		kind:   .direct
+		name:   'ExitProcess'
+		addend: -4
+		width:  .narrow
+	}
+	image := write(part, windows, .executable)!
+	// The directory is the ninth, and its three addresses are the template's
+	// start and end and the index slot.
+	directories := pe_header_offset + 4 + 20 + 112
+	directory_rva := u32_at(image, directories + 9 * 8)
+	assert directory_rva != 0
+	at := raw_offset(image, int(directory_rva))
+	// The four addresses are eight bytes each, so the low halves are what a
+	// four-byte read gives and the difference between them is the template's
+	// length.
+	start := u32_at(image, at)
+	end := u32_at(image, at + 8)
+	assert end - start == 4
+	assert u32_at(image, at + 16) > 0 // the index slot
+	assert u32_at(image, at + 24) == 0 // no callbacks
+	assert u32_at(image, at + 32) == 0 // the whole template is initialized
+	path := os.join_path(scratch_dir(), 'tls.exe')
+	os.write_file_array(path, image) or { panic(err) }
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping the run: no wine on this machine')
+		return
+	}
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', path])
+	assert result.exit_code == 7, 'wine left with ${result.exit_code}: ${result.output}'
 }
 
-// The emitter's own references are instructions, not fields: a call to a
-// library function is `call [rip + disp]` over a slot the loader fills, and a
-// string's address is a `lea` over its bytes. The container rewrites the whole
-// instruction, so the test asks the image it wrote where the call goes.
 fn test_a_fixup_is_rewritten_into_an_instruction_that_reaches_the_import_slot() {
 	windows := target.windows_x86_64()
 	mut part := unit.Program{}

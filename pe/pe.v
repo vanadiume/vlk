@@ -60,6 +60,7 @@ const scn_cnt_code = u32(0x00000020)
 const scn_cnt_initialized_data = u32(0x00000040)
 const scn_mem_discardable = u32(0x02000000)
 const scn_mem_execute = u32(0x20000000)
+const scn_align_shift = 20
 const scn_mem_read = u32(0x40000000)
 const scn_mem_write = u32(0x80000000)
 
@@ -108,9 +109,6 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 	if kind == .dll {
 		return error('a PE DLL is not written yet: the image would need an export table and nothing here builds one')
 	}
-	if program.tls_size > 0 {
-		return error('the program asks for ${program.tls_size} bytes of thread-local storage, and the PE writer places none')
-	}
 	if program.text.len == 0 {
 		return error('the program has no code')
 	}
@@ -118,6 +116,23 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 		return error('the entry point is at ${program.entry_place} and the code is ${program.text.len} bytes')
 	}
 	plan := plan_imports(program)!
+	// A program with thread-local storage needs one four-byte slot for the index
+	// the loader hands out, and the program reads that index through a name the
+	// link supplies. The slot is appended to the writable data, because a
+	// program that uses TLS usually has none of its own and the section has to
+	// exist anyway.
+	mut tls := TlsInfo{}
+	mut globals_blob := program.globals_blob.clone()
+	if program.tls_size > 0 {
+		for globals_blob.len % 4 != 0 {
+			globals_blob << u8(0)
+		}
+		tls.index_offset = globals_blob.len
+		globals_blob << []u8{len: 4}
+		if program.tls_blob.len > program.tls_size {
+			return error('the thread-local template is ${program.tls_blob.len} bytes and the block is ${program.tls_size}')
+		}
+	}
 	mut sections := [
 		Section{
 			name:            '.text'
@@ -134,10 +149,10 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 			alignment:       8
 		}
 	}
-	if program.globals_blob.len > 0 {
+	if globals_blob.len > 0 {
 		sections << Section{
 			name:            '.data'
-			data:            program.globals_blob.clone()
+			data:            globals_blob
 			characteristics: scn_cnt_initialized_data | scn_mem_read | scn_mem_write
 			alignment:       8
 		}
@@ -154,7 +169,7 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 	// gave a section to is refused rather than duplicated, because two
 	// sections of one name in an image is a file no loader can map by name.
 	for section in program.sections {
-		if section.name in ['.text', '.rdata', '.data', '.idata', '.reloc'] {
+		if section.name in ['.text', '.rdata', '.data', '.idata', '.reloc', '.tls', '.tlsdir'] {
 			return error('the program carries a named section ${section.name}, which is a name the writer gives to a section it builds from the blobs')
 		}
 		if section.name == '' {
@@ -170,6 +185,25 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 			alignment:       if section.alignment > 0 { section.alignment } else { 4 }
 		}
 	}
+	// The thread-local template and the directory that describes it are the
+	// writer's own sections: the unit carries the bytes and the size, and where
+	// they go is a fact about this image.
+	if program.tls_blob.len > 0 {
+		sections << Section{
+			name:            '.tls'
+			data:            program.tls_blob.clone()
+			characteristics: scn_cnt_initialized_data | scn_mem_read | scn_mem_write
+			alignment:       if program.tls_alignment > 1 { program.tls_alignment } else { 4 }
+		}
+	}
+	if program.tls_size > 0 {
+		sections << Section{
+			name:            '.tlsdir'
+			data:            []u8{len: 40}
+			characteristics: scn_cnt_initialized_data | scn_mem_read
+			alignment:       8
+		}
+	}
 	mut layout := lay(sections, machine)
 	// The import directory's own addresses are inside the section that holds
 	// it, so its bytes are written once the layout has said where that is.
@@ -177,11 +211,31 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 		idata_rva := layout.address('.idata') or { return error('.idata was placed and the layout lost it') }
 		layout.replace('.idata', plan.bytes(idata_rva))!
 	}
-	mut sites := relocate(mut layout, program, machine, plan)!
+	mut sites := []Site{}
+	if program.tls_size > 0 {
+		data_rva := layout.address('.data') or { return error('.data was placed and the layout lost it') }
+		tls.index_rva = data_rva + tls.index_offset
+		directory := tls_directory(program, machine, layout, tls)!
+		layout.replace('.tlsdir', directory)!
+		dir_rva := layout.address('.tlsdir') or { return error('.tlsdir was placed and the layout lost it') }
+		sites << Site{
+			rva:  dir_rva
+			kind: base_reloc_dir64
+		}
+		sites << Site{
+			rva:  dir_rva + 8
+			kind: base_reloc_dir64
+		}
+		sites << Site{
+			rva:  dir_rva + 16
+			kind: base_reloc_dir64
+		}
+	}
+	sites << relocate(mut layout, program, machine, plan, tls)!
 	// The emitter's own references are instruction-shaped and the merge's are
 	// fields, and both are filled once the layout is settled.
-	sites << apply_fixups(mut layout, program, machine, plan)!
-	sites << apply_data_fixups(mut layout, program, machine, plan)!
+	sites << apply_fixups(mut layout, program, machine, plan, tls)!
+	sites << apply_data_fixups(mut layout, program, machine, plan, tls)!
 	// The loader binary-searches the exception table, so its entries are sorted
 	// by the address they start at. The sort has to happen after the
 	// relocations, because until then the addresses are the ones the object
@@ -392,6 +446,10 @@ fn headers(program unit.Program, machine target.Target, layout Layout, plan Impo
 		put_u32(mut bytes, directories + 3 * 8, u32(exceptions))
 		put_u32(mut bytes, directories + 3 * 8 + 4, u32(layout.size_of('.pdata')))
 	}
+	if thread_local := layout.address('.tlsdir') {
+		put_u32(mut bytes, directories + 9 * 8, u32(thread_local))
+		put_u32(mut bytes, directories + 9 * 8 + 4, u32(layout.size_of('.tlsdir')))
+	}
 	if reloc := layout.address('.reloc') {
 		put_u32(mut bytes, directories + 5 * 8, u32(reloc))
 		put_u32(mut bytes, directories + 5 * 8 + 4, u32(layout.size_of('.reloc')))
@@ -414,6 +472,54 @@ fn headers(program unit.Program, machine target.Target, layout Layout, plan Impo
 		put(mut bytes, section.raw_offset, section.data)
 	}
 	return bytes
+}
+
+// TlsInfo is where the writer put the one slot a program with thread-local
+// storage reads its index from. The bytes of the block are the unit's; the slot
+// and the directory are the image's, because the loader is what fills them.
+struct TlsInfo {
+mut:
+	// index_offset is where the slot lies in the unit's writable data, before
+	// the section was placed.
+	index_offset int
+	// index_rva is the slot's address in the image, which is what the directory
+	// and a reference to `_tls_index` name.
+	index_rva int
+}
+
+// tls_directory is the forty bytes that tell the loader where the template is,
+// where the index slot is, which callbacks to run, and how much of each thread's
+// copy to zero-fill. The three addresses that point into the image are absolute,
+// so each is also a base relocation site, which `write` records.
+fn tls_directory(program unit.Program, machine target.Target, layout Layout, info TlsInfo) ![]u8 {
+	mut bytes := []u8{len: 40}
+	mut start := u64(0)
+	mut end := u64(0)
+	if program.tls_blob.len > 0 {
+		template := layout.address('.tls') or { return error('.tls was placed and the layout lost it') }
+		start = machine.load_base + u64(template)
+		end = start + u64(program.tls_blob.len)
+	}
+	put_u64(mut bytes, 0, start)
+	put_u64(mut bytes, 8, end)
+	put_u64(mut bytes, 16, machine.load_base + u64(info.index_rva))
+	put_u64(mut bytes, 24, 0) // the callback array, which this writer places none of
+	put_u32(mut bytes, 32, u32(program.tls_size - program.tls_blob.len))
+	put_u32(mut bytes, 36, tls_alignment_characteristics(program.tls_alignment))
+	return bytes
+}
+
+// tls_alignment_characteristics is the alignment of each thread's copy, written
+// the way a section states its alignment: a code whose value is one more than the
+// base-two logarithm of the alignment a byte count asks for.
+fn tls_alignment_characteristics(alignment int) u32 {
+	mut code := 0
+	mut size := 1
+	for size < alignment && code < 14 {
+		size <<= 1
+		code++
+	}
+	return u32(code + 1) << scn_align_shift
 }
 
 // section_characteristics is what a named section's kind means to a loader.

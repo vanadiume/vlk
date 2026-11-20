@@ -31,7 +31,7 @@ struct Site {
 
 // relocate fills every reference the program carries and answers the sites the
 // base relocation table has to cover.
-fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan) ![]Site {
+fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan, tls TlsInfo) ![]Site {
 	mut sites := []Site{}
 	for relocation in program.relocations {
 		section_name := match relocation.place {
@@ -52,7 +52,7 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 			return error("a relocation at ${relocation.offset} in ${section_name} does not lie inside the section's ${size} bytes")
 		}
 		field := layout.sections[index].rva + relocation.offset
-		place := reference(program, layout, plan, relocation.name)!
+		place := reference(program, layout, plan, tls, relocation.name)!
 		value := match relocation.kind {
 			.direct { i64(place) + relocation.addend - field }
 			.got {
@@ -117,14 +117,14 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 // what the name stands for. The machine's encoders are the same ones the ELF
 // container uses, because the instructions are the machine's; what differs is
 // where the name stands, and that is the referent below.
-fn apply_fixups(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan) ![]Site {
+fn apply_fixups(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan, tls TlsInfo) ![]Site {
 	if program.fixups.len == 0 {
 		return []Site{}
 	}
 	index := layout.index('.text') or { return error('.text is not a section of this image') }
 	text := layout.sections[index].rva
 	for fixup in program.fixups {
-		referent := fixup_referent(program, layout, plan, fixup.kind, fixup.name)!
+		referent := fixup_referent(program, layout, plan, tls, fixup.kind, fixup.name)!
 		instruction := text + fixup.start
 		disp := i32(referent - (instruction + fixup.length))
 		mut replacement := []u8{}
@@ -180,7 +180,7 @@ fn apply_fixups(mut layout Layout, program unit.Program, machine target.Target, 
 // difference when it maps the image somewhere else. An imported address is the
 // one kind left at zero, because the loader writes it into the slot rather than
 // into the data.
-fn apply_data_fixups(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan) ![]Site {
+fn apply_data_fixups(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan, tls TlsInfo) ![]Site {
 	if program.data_fixups.len == 0 {
 		return []Site{}
 	}
@@ -193,7 +193,7 @@ fn apply_data_fixups(mut layout Layout, program unit.Program, machine target.Tar
 		if fixup.kind == .import_address {
 			continue
 		}
-		referent := fixup_referent(program, layout, plan, fixup.kind, fixup.name)!
+		referent := fixup_referent(program, layout, plan, tls, fixup.kind, fixup.name)!
 		value := i64(machine.load_base) + i64(referent) + fixup.addend
 		if fixup.offset < 0 || fixup.offset + 8 > layout.sections[index].virtual_size {
 			return error('an initializer for ${fixup.name} at ${fixup.offset} does not lie inside the writable data')
@@ -211,7 +211,10 @@ fn apply_data_fixups(mut layout Layout, program unit.Program, machine target.Tar
 // address relative to its base. The kinds are the emitter's: a call or a jump
 // reaches a label, an address reference reads a string, a constant or an
 // object's place, and an import is the slot the loader writes.
-fn fixup_referent(program unit.Program, layout Layout, plan ImportPlan, kind unit.FixupKind, name string) !int {
+fn fixup_referent(program unit.Program, layout Layout, plan ImportPlan, tls TlsInfo, kind unit.FixupKind, name string) !int {
+	if tls.index_rva > 0 && name == '_tls_index' {
+		return tls.index_rva
+	}
 	match kind {
 		.call_local, .jump_local, .branch_zero, .branch_nonzero, .function_address {
 			text := layout.address('.text') or { return error('.text is not a section of this image') }
@@ -286,7 +289,13 @@ fn fixup_referent(program unit.Program, layout Layout, plan ImportPlan, kind uni
 // relative to the image's base. The order is the same one the ELF writer asks
 // its own referent question in: a name the link answered itself comes before the
 // slot a unit keeps for it, because the answer is where the bytes are.
-fn reference(program unit.Program, layout Layout, plan ImportPlan, name string) !int {
+fn reference(program unit.Program, layout Layout, plan ImportPlan, tls TlsInfo, name string) !int {
+	// The index a thread-local model reads is a slot the image holds and the
+	// loader fills, and the link is what names it: no unit defines it, because
+	// the number in it is not known until the image is mapped.
+	if tls.index_rva > 0 && name == '_tls_index' {
+		return tls.index_rva
+	}
 	if relocation_slot := plan.slots[name] {
 		idata := layout.address('.idata') or { return error('.idata is not a section of this image') }
 		return idata + relocation_slot
