@@ -194,8 +194,13 @@ pub enum RelocationKind {
 // asked for the name by number rather than by name.
 pub struct Import {
 pub:
-	name       string
-	library    string
+	name    string
+	library string
+	// symbol is the spelling this link's own references use for the import,
+	// when an import library defined it under another name: its `__imp_`
+	// member defines the address of the import's slot while the DLL exports
+	// the bare name. Empty means the two are the same.
+	symbol     string
 	hint       u16
 	ordinal    u16
 	by_ordinal bool

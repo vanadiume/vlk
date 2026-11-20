@@ -13,8 +13,11 @@ import os
 // so a well formed member needs no count and a wrong one states its own.
 struct ImportSpec {
 mut:
-	symbol       string
-	library      string
+	symbol  string
+	library string
+	// exported is the third string a member carries when the DLL exports a
+	// name other than the symbol it defines. Empty writes two strings.
+	exported     string
 	kind         u16
 	name_type    u16
 	ordinal_hint u16
@@ -49,6 +52,10 @@ fn build_import_member(spec ImportSpec) []u8 {
 	area << u8(0)
 	area << spec.library.bytes()
 	area << u8(0)
+	if spec.exported != '' {
+		area << spec.exported.bytes()
+		area << u8(0)
+	}
 	mut size := spec.size_of_data
 	if size == 0 {
 		size = u32(area.len)
@@ -325,4 +332,26 @@ fn test_import_a_library_a_librarian_wrote_is_read() {
 	assert by_name['baz'].by_ordinal
 	assert by_name['baz'].hint == 9
 	assert by_name['baz'].kind == import_code
+}
+
+// A member that defines the slot's spelling while the DLL exports the bare name
+// carries a third string saying so. Without it the linker would ask the DLL for
+// `__imp_foo`, which no DLL exports.
+fn test_import_a_member_names_the_name_the_dll_exports() {
+	mut spec := named_import('__imp_foo', 'mylib.dll', import_data)
+	spec.exported = 'foo'
+	member := read_import_member(build_import_member(spec))!
+	assert member.name == '__imp_foo'
+	assert member.exported == 'foo'
+	assert member.library == 'mylib.dll'
+	assert !member.by_ordinal
+}
+
+// A member whose two names agree carries two strings, and the export name is
+// then the symbol name.
+fn test_import_a_member_with_two_strings_exports_its_symbol() {
+	member := read_import_member(build_import_member(named_import('foo', 'mylib.dll',
+		import_code)))!
+	assert member.name == 'foo'
+	assert member.exported == ''
 }

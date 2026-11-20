@@ -41,7 +41,11 @@ mut:
 
 // ImportEntry is one name a DLL answers, with the hint the object stated.
 struct ImportEntry {
-	name       string
+	name string
+	// symbol is the spelling this link's references use for the import, when
+	// an import library defined it under another name, and empty when the two
+	// are the same.
+	symbol     string
 	hint       u16
 	by_ordinal bool
 	ordinal    u16
@@ -55,8 +59,12 @@ struct ImportEntry {
 fn plan_imports(program unit.Program) !ImportPlan {
 	mut records := map[string]unit.Import{}
 	for record in program.imports_by_library {
-		if record.name !in records {
-			records[record.name] = record
+		// The record is found by the spelling this link's references use,
+		// which is the symbol an import library defined rather than the name
+		// the DLL exports.
+		key := if record.symbol != '' { record.symbol } else { record.name }
+		if key !in records {
+			records[key] = record
 		}
 	}
 	mut groups := map[string][]ImportEntry{}
@@ -78,6 +86,7 @@ fn plan_imports(program unit.Program) !ImportPlan {
 		mut names := groups[record.library]
 		names << ImportEntry{
 			name:       record.name
+			symbol:     record.symbol
 			hint:       record.hint
 			by_ordinal: record.by_ordinal
 			ordinal:    record.ordinal
@@ -127,7 +136,10 @@ fn plan_imports(program unit.Program) !ImportPlan {
 	mut slots := map[string]int{}
 	for dll in dlls {
 		for i, entry in dll.entries {
-			slots[entry.name] = dll.addresses + i * 8
+			// A reference reaches the slot by the spelling the object used,
+			// which is the `__imp_` one when an import library defined it.
+			key := if entry.symbol != '' { entry.symbol } else { entry.name }
+			slots[key] = dll.addresses + i * 8
 		}
 	}
 	return ImportPlan{

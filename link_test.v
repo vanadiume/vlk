@@ -943,3 +943,73 @@ fn test_a_comdat_group_two_objects_carry_is_kept_once() {
 	result := os.exec(['/usr/bin/wine', image])
 	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
 }
+
+fn put_u32_at(mut bytes []u8, at int, value u32) {
+	for i in 0 .. 4 {
+		bytes[at + i] = u8((value >> (8 * i)) & 0xff)
+	}
+}
+
+// import_library is an archive holding one short import member, which is how a
+// Windows import library says that a name comes from a DLL. The member's symbol
+// is the spelling the object uses, `__imp_` and all, and its string area names
+// the DLL.
+fn import_library(symbol string, dll string, exported string) []u8 {
+	// The third string is the DLL's own name for the export, which a member
+	// that defines `__imp_foo` needs to say that the DLL answers to `foo`.
+	strings := '${symbol}\x00${dll}\x00${exported}\x00'
+	mut member := []u8{len: 20}
+	put_u16_at(mut member, 0, 0)
+	put_u16_at(mut member, 2, u16(0xffff))
+	put_u16_at(mut member, 4, 0)
+	put_u16_at(mut member, 6, u16(0x8664))
+	put_u32_at(mut member, 12, u32(strings.len))
+	// Type is code, and NameType is IMPORT_NAME, which is the bits above the
+	// low two: a member that named no type would be an import by ordinal.
+	put_u16_at(mut member, 18, u16(1) << 2)
+	member << strings.bytes()
+	return archive_of('imp', member, [symbol])
+}
+
+// An object that calls a DLL function says nothing about which DLL answers it; an
+// import library is what says so. The test links a `dllimport` object against an
+// archive holding one short import member, and the image that comes out imports
+// the bare name from the DLL while the object's own spelling reaches the slot.
+fn test_an_import_library_names_the_dll_a_coff_object_needs() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write a COFF object with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('import_library')
+	os.mkdir_all(dir) or { panic(err) }
+	source := os.join_path(dir, 'exit.c')
+	os.write_file(source, '__declspec(dllimport) void ExitProcess(unsigned int code);\nint main(void) { ExitProcess(42); return 1; }\n') or {
+		panic(err)
+	}
+	object := os.join_path(dir, 'exit.obj')
+	written := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', source, '-o', object])
+	if written.exit_code != 0 {
+		eprintln('skipping: clang could not write the object: ${written.output}')
+		return
+	}
+	imports := os.join_path(dir, 'kernel32.lib')
+	os.write_file_array(imports, import_library('__imp_ExitProcess', 'kernel32.dll', 'ExitProcess')) or {
+		panic(err)
+	}
+	image := os.join_path(dir, 'imports.exe')
+	report := link_files([object, imports], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
+	assert report.units == 1
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+}

@@ -119,6 +119,10 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 	// The COMDAT groups the link has kept, shared by every input so that the
 	// first object carrying a group keeps it and the rest are discarded.
 	mut comdats := map[string]bool{}
+	// The library each imported name comes from, as the import libraries that
+	// answered it stated. An object names no library, so this is what a short
+	// import member adds to the link.
+	mut import_libraries := map[string]unit.Import{}
 	mut provided := map[string]bool{}
 	mut needed := map[string]bool{}
 	dirs := library.search_dirs(library_dirs, machine.library_dirs)
@@ -132,7 +136,8 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 			}
 			.archive {
 				parts := archive.read(bytes) or { return error('${path}: ${err.msg()}') }
-				members := pull(parts, path, machine, mut needed, mut provided, mut comdats)!
+				members := pull(parts, path, machine, mut needed, mut provided, mut comdats, mut
+					import_libraries)!
 				out.pulled += members.len
 				out.units << members
 			}
@@ -159,7 +164,8 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 		for found in library.archive_libraries(libraries, dirs, static_link)! {
 			bytes := os.read_bytes(found.path) or { return error('${found.path}: ${err.msg()}') }
 			parts := archive.read(bytes) or { return error('${found.path}: ${err.msg()}') }
-			members := pull(parts, found.path, machine, mut needed, mut provided, mut comdats)!
+			members := pull(parts, found.path, machine, mut needed, mut provided, mut comdats,
+				mut import_libraries)!
 			out.pulled += members.len
 			out.units << members
 		}
@@ -170,9 +176,38 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 	// when a whole pass over the group pulls nothing.
 	for group in groups {
 		read_group(group, dirs, static_link, machine, mut needed, mut provided, mut out, mut
-			comdats)!
+			comdats, mut import_libraries)!
+	}
+	if import_libraries.len > 0 {
+		for i in 0 .. out.units.len {
+			out.units[i] = stamp_imports(out.units[i], import_libraries)
+		}
 	}
 	return out
+}
+
+// stamp_imports records the library an imported name comes from on the unit that
+// needs it, because a COFF object leaves the name undefined and says nothing
+// about which DLL answers it. The import library is what says so, and it says it
+// in a member the unit never sees.
+fn stamp_imports(part unit.Program, import_libraries map[string]unit.Import) unit.Program {
+	mut program := part
+	mut seen := map[string]bool{}
+	for record in program.imports_by_library {
+		key := if record.symbol != '' { record.symbol } else { record.name }
+		seen[key] = true
+	}
+	mut records := program.imports_by_library.clone()
+	for name in program.imports {
+		record := import_libraries[name] or { continue }
+		if name in seen {
+			continue
+		}
+		seen[name] = true
+		records << record
+	}
+	program.imports_by_library = records
+	return program
 }
 
 // pending_group_archive is one archive of a group while the group is swept: the
@@ -188,7 +223,7 @@ struct PendingGroupArchive {
 // the inputs outside it, so a name either side of the markers answers the other.
 // The paths and the -l names are read first, in their own order, and then the
 // archives are swept together until a pass pulls nothing.
-fn read_group(group Group, dirs []string, static_link bool, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut out Read, mut comdats map[string]bool) ! {
+fn read_group(group Group, dirs []string, static_link bool, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut out Read, mut comdats map[string]bool, mut import_libraries map[string]unit.Import) ! {
 	mut pending := []PendingGroupArchive{}
 	for path in group.paths {
 		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
@@ -233,7 +268,7 @@ fn read_group(group Group, dirs []string, static_link bool, machine target.Targe
 			// remembers between passes.
 			mut entry := pending[index]
 			members := pull_members(entry.parts, entry.path, machine, mut entry.pulled, mut needed,
-				mut provided, mut comdats)!
+				mut provided, mut comdats, mut import_libraries)!
 			if members.len > 0 {
 				out.pulled += members.len
 				out.units << members
@@ -287,13 +322,13 @@ fn provided_with(mut provided map[string]bool, part unit.Program) {
 // rule ld follows and what keeps the C library's copy of a name the runtime's own
 // crt1.o already defines out of the link: two definitions of one name are what a
 // link refuses.
-fn pull(parts archive.Archive, path string, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut comdats map[string]bool) ![]unit.Program {
+fn pull(parts archive.Archive, path string, machine target.Target, mut needed map[string]bool, mut provided map[string]bool, mut comdats map[string]bool, mut import_libraries map[string]unit.Import) ![]unit.Program {
 	mut out := []unit.Program{}
 	mut pulled := map[int]bool{}
 	mut again := true
 	for again {
 		members := pull_members(parts, path, machine, mut pulled, mut needed, mut provided, mut
-			comdats)!
+			comdats, mut import_libraries)!
 		if members.len == 0 {
 			again = false
 		} else {
@@ -307,7 +342,7 @@ fn pull(parts archive.Archive, path string, machine target.Target, mut needed ma
 // needs and whose index has not been given up yet. The caller decides whether to
 // sweep the archive again, which is what `pull` does for one archive and what a
 // group does for all of its archives together.
-fn pull_members(parts archive.Archive, path string, machine target.Target, mut pulled map[int]bool, mut needed map[string]bool, mut provided map[string]bool, mut comdats map[string]bool) ![]unit.Program {
+fn pull_members(parts archive.Archive, path string, machine target.Target, mut pulled map[int]bool, mut needed map[string]bool, mut provided map[string]bool, mut comdats map[string]bool, mut import_libraries map[string]unit.Import) ![]unit.Program {
 	mut out := []unit.Program{}
 	mut names := parts.index.keys()
 	names.sort()
@@ -321,6 +356,38 @@ fn pull_members(parts archive.Archive, path string, machine target.Target, mut p
 		}
 		pulled[index] = true
 		member := parts.members[index]
+		// A short import member is not an object: it is the archive saying
+		// which DLL answers one name. It defines nothing in the image, so what
+		// the link takes from it is the record and not a unit.
+		if coff.is_import_member(member.bytes) {
+			record := coff.read_import_member(member.bytes) or {
+				return error('${path}: ${member.name}: ${err.msg()}')
+			}
+			spelling := record.name
+			// The member says what the DLL calls the name when that differs
+			// from the symbol it defines. An older member leaves it out, and
+			// the `__imp_` prefix is then the only thing saying which of the
+			// two names the DLL exports.
+			exported := if record.exported != '' {
+				record.exported
+			} else if spelling.starts_with('__imp_') {
+				spelling.all_after('__imp_')
+			} else {
+				spelling
+			}
+			import_libraries[spelling] = unit.Import{
+				name:       exported
+				library:    record.library
+				symbol:     if spelling == exported { '' } else { spelling }
+				// A member that names an export number keeps it in the same
+				// field a name member keeps its hint in.
+				hint:       if record.by_ordinal { u16(0) } else { record.hint }
+				ordinal:    if record.by_ordinal { record.hint } else { u16(0) }
+				by_ordinal: record.by_ordinal
+			}
+			provided[spelling] = true
+			continue
+		}
 		part := read_object(member.bytes, machine, mut comdats) or {
 			return error('${path}: ${member.name}: ${err.msg()}')
 		}

@@ -66,10 +66,14 @@ pub:
 	kind u16
 	// name is the symbol as the member spells it, undecorated and undecoded:
 	// __imp_ symbols arrive with the prefix the archive wrote, and the caller
-	// decides what prefix means. The DLL's export name of a by-ordinal member
-	// is not known here.
+	// decides what prefix means.
 	name    string
 	library string
+	// exported is the name the DLL exports when it differs from the symbol the
+	// member defines. A member for `__imp_foo` names `__imp_foo` and says the
+	// DLL answers to `foo`; a member whose two names agree carries no third
+	// string and leaves this empty.
+	exported string
 }
 
 // is_import_member says whether a member holds a short import header. It reads
@@ -148,6 +152,23 @@ pub fn read_import_member(bytes []u8) !ImportMember {
 		return error('the DLL name of the import member has no terminator in its ${area.len}-byte string area')
 	}
 	library := area[symbol_end + 1..library_end].bytestr()
+	// A third string, when the area holds one, is the DLL's own name for the
+	// export. A member that defines the name the DLL exports carries two
+	// strings and nothing after them.
+	mut exported := ''
+	if library_end + 1 < area.len {
+		rest := area[library_end + 1..]
+		mut third_end := -1
+		for i, byte in rest {
+			if byte == u8(0) {
+				third_end = i
+				break
+			}
+		}
+		if third_end > 0 {
+			exported = rest[..third_end].bytestr()
+		}
+	}
 	kind := type_info & import_type_mask
 	if kind > import_const {
 		return error('the import member is type ${kind}, and the format defines code, data and const')
@@ -161,5 +182,6 @@ pub fn read_import_member(bytes []u8) !ImportMember {
 		kind:            kind
 		name:            name
 		library:         library
+		exported:        exported
 	}
 }
