@@ -108,12 +108,6 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 	if kind == .dll {
 		return error('a PE DLL is not written yet: the image would need an export table and nothing here builds one')
 	}
-	if program.fixups.len > 0 {
-		return error("the program carries ${program.fixups.len} fixups, which are this compiler's own emitter's shape, and the PE writer fills relocations")
-	}
-	if program.data_fixups.len > 0 {
-		return error('the program carries ${program.data_fixups.len} data fixups, and the PE writer fills relocations')
-	}
 	if program.tls_size > 0 {
 		return error('the program asks for ${program.tls_size} bytes of thread-local storage, and the PE writer places none')
 	}
@@ -183,7 +177,11 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 		idata_rva := layout.address('.idata') or { return error('.idata was placed and the layout lost it') }
 		layout.replace('.idata', plan.bytes(idata_rva))!
 	}
-	sites := relocate(mut layout, program, machine, plan)!
+	mut sites := relocate(mut layout, program, machine, plan)!
+	// The emitter's own references are instruction-shaped and the merge's are
+	// fields, and both are filled once the layout is settled.
+	sites << apply_fixups(mut layout, program, machine, plan)!
+	sites << apply_data_fixups(mut layout, program, machine, plan)!
 	// The loader binary-searches the exception table, so its entries are sorted
 	// by the address they start at. The sort has to happen after the
 	// relocations, because until then the addresses are the ones the object

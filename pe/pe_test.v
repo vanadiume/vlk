@@ -188,19 +188,68 @@ fn test_a_thread_local_program_is_refused_by_size() {
 	}
 }
 
-fn test_a_program_the_emitter_wrote_is_refused_for_its_fixups() {
-	mut part := returning()
+// The emitter's own references are instructions, not fields: a call to a
+// library function is `call [rip + disp]` over a slot the loader fills, and a
+// string's address is a `lea` over its bytes. The container rewrites the whole
+// instruction, so the test asks the image it wrote where the call goes.
+fn test_a_fixup_is_rewritten_into_an_instruction_that_reaches_the_import_slot() {
+	windows := target.windows_x86_64()
+	mut part := unit.Program{}
+	// The shadow space a Windows call needs, the status into the register the
+	// callee reads, then the call through the import's slot. The call is the
+	// fixup: six bytes, with the register left empty because a call reads
+	// nothing into one.
+	part.text = [
+		u8(0x48),
+		u8(0x83),
+		u8(0xec),
+		u8(0x28), // sub rsp, 0x28
+		u8(0xb9),
+		u8(42),
+		u8(0),
+		u8(0),
+		u8(0), // mov ecx, 42
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + 0]
+		u8(0x48),
+		u8(0x83),
+		u8(0xc4),
+		u8(0x28), // add rsp, 0x28
+		u8(0xc3), // ret
+	]
+	part.labels['main'] = 0
+	part.defined['main'] = true
+	part.entry_place = 0
+	part.imports << 'ExitProcess'
+	part.imports_by_library << unit.Import{
+		name:    'ExitProcess'
+		library: 'kernel32.dll'
+	}
 	part.fixups << unit.Fixup{
-		start:  1
-		length: 4
+		start:  9
+		length: 6
 		kind:   .call_import
 		name:   'ExitProcess'
 	}
-	if _ := write(part, target.windows_x86_64(), .executable) {
-		assert false, 'a fixup is not a relocation and this writer has no rule for one'
-	} else {
-		assert err.msg().contains('fixups')
+	image := write(part, windows, .executable)!
+	// The slot is the first entry of the address table, and the call's
+	// displacement is measured from the end of the instruction.
+	slot := first_thunk(image)
+	written := i32(u32_at(image, raw_offset(image, 0x1000 + 11)))
+	assert written == i32(slot - 0x100f), 'the call points at ${written} and the slot is at ${slot - 0x100f}'
+	path := os.join_path(scratch_dir(), 'fixup.exe')
+	os.write_file_array(path, image) or { panic(err) }
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping the run: no wine on this machine')
+		return
 	}
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', path])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
 }
 
 fn test_a_dll_is_refused_until_an_export_table_exists() {
@@ -358,4 +407,31 @@ fn test_a_named_section_that_takes_a_blob_s_name_is_refused() {
 	} else {
 		assert err.msg().contains('.data')
 	}
+}
+
+fn test_a_data_fixup_writes_the_address_and_records_it_for_the_loader() {
+	windows := target.windows_x86_64()
+	mut part := returning()
+	part.globals_blob = []u8{len: 8}
+	part.globals['handler'] = unit.GlobalSlot{
+		offset: 0
+		width:  8
+	}
+	part.data_fixups << unit.DataFixup{
+		offset: 0
+		kind:   .function_address
+		name:   'main'
+	}
+	image := write(part, windows, .executable)!
+	directories := pe_header_offset + 4 + 20 + 112
+	// The sections are the code and the writable data, so the data is at the
+	// second page and the address written is the image's base plus the code's.
+	data_rva := 0x2000
+	at := raw_offset(image, data_rva)
+	// The image's base is 0x140000000, so the address is that plus the code's.
+	assert u32_at(image, at) == 0x40001000
+	assert u32_at(image, at + 4) == 0x1
+	reloc_rva := u32_at(image, directories + 5 * 8)
+	assert reloc_rva != 0
+	assert u32_at(image, raw_offset(image, int(reloc_rva)) + 8) == 0xA000 | (data_rva & 0xfff)
 }

@@ -111,6 +111,177 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 	return sites
 }
 
+// apply_fixups rewrites the instructions a unit's emitter left unfinished. A
+// fixup is instruction-shaped: the emitter keeps the whole instruction and its
+// register, and the container replaces it with one whose displacement reaches
+// what the name stands for. The machine's encoders are the same ones the ELF
+// container uses, because the instructions are the machine's; what differs is
+// where the name stands, and that is the referent below.
+fn apply_fixups(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan) ![]Site {
+	if program.fixups.len == 0 {
+		return []Site{}
+	}
+	index := layout.index('.text') or { return error('.text is not a section of this image') }
+	text := layout.sections[index].rva
+	for fixup in program.fixups {
+		referent := fixup_referent(program, layout, plan, fixup.kind, fixup.name)!
+		instruction := text + fixup.start
+		disp := i32(referent - (instruction + fixup.length))
+		mut replacement := []u8{}
+		match fixup.kind {
+			.call_local { replacement = machine.call_near(disp) }
+			.call_import { replacement = machine.call_slot(disp) }
+			.take_address, .take_wide_address, .global_address, .got_address, .function_address {
+				register := machine.reg(fixup.register) or {
+					return error('no register named ${fixup.register} to compute an address into')
+				}
+				replacement = machine.address_of(register, disp)
+			}
+			.import_address {
+				register := machine.reg(fixup.register) or {
+					return error('no register named ${fixup.register} to compute an address into')
+				}
+				replacement = machine.load_slot_value(register, disp)
+			}
+			.float_constant {
+				register := machine.float_reg(fixup.register) or {
+					return error('no floating-point register named ${fixup.register} to read a constant into')
+				}
+				replacement = machine.load_double_constant(register, disp)!
+			}
+			.single_constant {
+				register := machine.float_reg(fixup.register) or {
+					return error('no floating-point register named ${fixup.register} to read a constant into')
+				}
+				replacement = machine.load_float_constant(register, disp)!
+			}
+			.jump_local { replacement = machine.jump(disp) }
+			.branch_zero { replacement = machine.jump_if_zero(disp) }
+			.branch_nonzero { replacement = machine.jump_if_not_zero(disp) }
+			.section_address {
+				// The emitter names one of its own sections rather than a
+				// symbol, and a section is not an instruction shape of its
+				// own: a field reference to a place in a blob is written by
+				// the merge's relocations, not by a fixup.
+				return error('a fixup names ${fixup.name}, which is a place in a blob rather than an instruction reference')
+			}
+		}
+		if replacement.len != fixup.length {
+			return error('the reference to ${fixup.name} was ${fixup.length} bytes and became ${replacement.len}')
+		}
+		put(mut layout.sections[index].data, fixup.start, replacement)
+	}
+	return []Site{}
+}
+
+// apply_data_fixups writes the addresses a unit's writable data holds as
+// initializers. Each is eight bytes, so each is a base relocation site: the
+// number written is the image's base plus a place, and the loader adds the
+// difference when it maps the image somewhere else. An imported address is the
+// one kind left at zero, because the loader writes it into the slot rather than
+// into the data.
+fn apply_data_fixups(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan) ![]Site {
+	if program.data_fixups.len == 0 {
+		return []Site{}
+	}
+	index := layout.index('.data') or {
+		return error('the program holds ${program.data_fixups.len} address-valued initializers and no writable data')
+	}
+	data_rva := layout.sections[index].rva
+	mut sites := []Site{}
+	for fixup in program.data_fixups {
+		if fixup.kind == .import_address {
+			continue
+		}
+		referent := fixup_referent(program, layout, plan, fixup.kind, fixup.name)!
+		value := i64(machine.load_base) + i64(referent) + fixup.addend
+		if fixup.offset < 0 || fixup.offset + 8 > layout.sections[index].virtual_size {
+			return error('an initializer for ${fixup.name} at ${fixup.offset} does not lie inside the writable data')
+		}
+		put_u64_at(mut layout.sections[index].data, fixup.offset, value)
+		sites << Site{
+			rva:  data_rva + fixup.offset
+			kind: base_reloc_dir64
+		}
+	}
+	return sites
+}
+
+// fixup_referent is where the name a fixup carries stands in this image, as an
+// address relative to its base. The kinds are the emitter's: a call or a jump
+// reaches a label, an address reference reads a string, a constant or an
+// object's place, and an import is the slot the loader writes.
+fn fixup_referent(program unit.Program, layout Layout, plan ImportPlan, kind unit.FixupKind, name string) !int {
+	match kind {
+		.call_local, .jump_local, .branch_zero, .branch_nonzero, .function_address {
+			text := layout.address('.text') or { return error('.text is not a section of this image') }
+			return text + (program.labels[name] or {
+				return error('no code for ${name}')
+			})
+		}
+		.call_import, .import_address, .got_address {
+			slot := plan.slots[name] or {
+				return error('${name} is reached as an import and no import table entry was made for it')
+			}
+			idata := layout.address('.idata') or { return error('.idata is not a section of this image') }
+			return idata + slot
+		}
+		.take_address {
+			rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+			return rdata + (program.strings[name] or {
+				return error('no string ${name} in the image')
+			})
+		}
+		.take_wide_address {
+			rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+			return rdata + (program.wide_strings[name] or {
+				return error('no wide string ${name} in the image')
+			})
+		}
+		.float_constant, .single_constant {
+			rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+			return rdata + (program.doubles[name] or {
+				return error('no floating constant ${name} in the image')
+			})
+		}
+		.section_address {
+			return match name {
+				unit.section_key_text {
+					layout.address('.text') or { return error('.text is not a section of this image') }
+				}
+				unit.section_key_rodata {
+					layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+				}
+				unit.section_key_data {
+					layout.address('.data') or { return error('.data is not a section of this image') }
+				}
+				else { return error('${name} is not a section of this image') }
+			}
+		}
+		.global_address {
+			if slot := program.read_only_globals[name] {
+				rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+				return rdata + slot.offset
+			}
+			if definition := program.bound[name] {
+				if definition.function {
+					text := layout.address('.text') or { return error('.text is not a section of this image') }
+					return text + definition.offset
+				}
+				if definition.tls {
+					return error('${name} is a thread-local and the PE writer places none')
+				}
+				data := layout.address('.data') or { return error('.data is not a section of this image') }
+				return data + definition.offset
+			}
+			data := layout.address('.data') or { return error('.data is not a section of this image') }
+			return data + (program.globals[name] or {
+				return error('no global ${name} in the image')
+			}).offset
+		}
+	}
+}
+
 // reference is where one name stands in the image being written, as an address
 // relative to the image's base. The order is the same one the ELF writer asks
 // its own referent question in: a name the link answered itself comes before the
