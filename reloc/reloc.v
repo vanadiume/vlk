@@ -39,6 +39,12 @@ pub:
 // field is comes across unchanged, because the container writes that many bytes.
 pub fn relocations(part unit.Program, unit_index int, text_base int, string_base int, globals_base int, tls_base int, init_run_base int, fini_run_base int, eh_frame_base int, tables Tables, mut out []unit.Relocation) {
 	for relocation in part.relocations {
+		// A field in a named section is not moved here: the merge places the
+		// section itself and rebases the reference with it, because a named
+		// section is not one of the blobs this function knows the base of.
+		if relocation.place == .section {
+			continue
+		}
 		mut addend := relocation.addend
 		mut name := relocation.name
 		place_base := match relocation.place {
@@ -49,6 +55,7 @@ pub fn relocations(part unit.Program, unit_index int, text_base int, string_base
 			// of the merged thread-local block, which is a third place the
 			// merge lays out rather than one of the two data blobs.
 			.tls { tls_base }
+			.section { 0 }
 		}
 		mut field := relocation.offset + place_base
 		// A field inside one of the two gathered fragments moves with the

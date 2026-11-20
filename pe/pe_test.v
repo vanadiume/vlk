@@ -243,3 +243,119 @@ fn test_an_absolute_field_gets_a_base_relocation() {
 	assert result.exit_code == 0, result.output
 	assert result.output.contains('DIR64')
 }
+
+// A named section is what a COFF object brings that the three blobs cannot hold:
+// `.pdata` and `.xdata` are sections of their own, and their references are
+// measured inside the section rather than from a blob's start. The writer places
+// them, fills the references with image-relative addresses, and names the
+// exception directory the loader reads.
+fn test_a_named_section_is_placed_and_its_references_are_image_relative() {
+	windows := target.windows_x86_64()
+	mut part := returning()
+	part.sections << unit.Section{
+		name:      '.xdata'
+		kind:      .read_only
+		alignment: 4
+		data:      [u8(0x01), 0, 0, 0]
+	}
+	part.sections << unit.Section{
+		name:      '.pdata'
+		kind:      .read_only
+		alignment: 4
+		data:      []u8{len: 12}
+	}
+	part.relocations << unit.Relocation{
+		offset:  0
+		place:   .section
+		section: '.pdata'
+		kind:    .rva
+		name:    'main'
+		addend:  0
+		width:   .narrow
+	}
+	part.relocations << unit.Relocation{
+		offset:  4
+		place:   .section
+		section: '.pdata'
+		kind:    .rva
+		name:    'main'
+		addend:  1
+		width:   .narrow
+	}
+	part.relocations << unit.Relocation{
+		offset:  8
+		place:   .section
+		section: '.pdata'
+		kind:    .rva
+		name:    '.xdata'
+		addend:  0
+		width:   .narrow
+	}
+	image := write(part, windows, .executable)!
+	directories := pe_header_offset + 4 + 20 + 112
+	// The sections go in the order the program carries them, so .xdata is the
+	// second section and .pdata the third in this image.
+	assert u32_at(image, directories + 3 * 8) == 0x3000
+	assert u32_at(image, directories + 3 * 8 + 4) == 12
+	entry := raw_offset(image, 0x3000)
+	assert entry > 0
+	assert u32_at(image, entry) == 0x1000
+	assert u32_at(image, entry + 4) == 0x1001
+	assert u32_at(image, entry + 8) == 0x2000
+}
+
+fn test_the_exception_table_is_sorted_by_the_address_each_entry_starts_at() {
+	windows := target.windows_x86_64()
+	mut part := returning()
+	// Two entries, the later address written first, which is the shape a
+	// merge of objects in input order produces.
+	mut table := []u8{len: 24}
+	put_u32(mut table, 0, 0x1400)
+	put_u32(mut table, 12, 0x1000)
+	part.sections << unit.Section{
+		name:      '.pdata'
+		kind:      .read_only
+		alignment: 4
+		data:      table
+	}
+	image := write(part, windows, .executable)!
+	at := raw_offset(image, 0x2000)
+	assert u32_at(image, at) == 0x1000
+	assert u32_at(image, at + 12) == 0x1400
+}
+
+fn test_a_resource_section_is_placed_and_the_directory_names_it() {
+	windows := target.windows_x86_64()
+	mut part := returning()
+	// A resource directory whose only content is a root node with no entries,
+	// which is enough to prove the bytes are carried and the header points at
+	// them. A real .rsrc comes from a resource compiler and is copied whole.
+	part.sections << unit.Section{
+		name:      '.rsrc'
+		kind:      .read_only
+		alignment: 4
+		data:      []u8{len: 16}
+	}
+	image := write(part, windows, .executable)!
+	directories := pe_header_offset + 4 + 20 + 112
+	assert u32_at(image, directories + 2 * 8) == 0x2000
+	assert u32_at(image, directories + 2 * 8 + 4) == 16
+	at := raw_offset(image, 0x2000)
+	for i in 0 .. 16 {
+		assert image[at + i] == 0
+	}
+}
+
+fn test_a_named_section_that_takes_a_blob_s_name_is_refused() {
+	mut part := returning()
+	part.sections << unit.Section{
+		name: '.data'
+		kind: .data
+		data: [u8(1)]
+	}
+	if _ := write(part, target.windows_x86_64(), .executable) {
+		assert false, 'the writer builds .data from the globals blob'
+	} else {
+		assert err.msg().contains('.data')
+	}
+}

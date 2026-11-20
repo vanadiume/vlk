@@ -628,3 +628,72 @@ fn test_an_executable_stack_is_the_links_if_any_unit_asks_for_one() {
 	}
 	assert mixed.executable_stack
 }
+
+// A named section is one no blob holds: the merge has to concatenate the units'
+// parts by name and move each reference by where its own part landed, and the
+// kind two units give the same name has to agree, or one of them is describing
+// bytes the other would not place the same way.
+fn test_a_named_section_is_concatenated_by_name() {
+	mut first := defining('one', [u8(0xc3)])
+	first.sections << unit.Section{
+		name:      '.pdata'
+		kind:      .read_only
+		alignment: 4
+		data:      [u8(1), u8(1), u8(1), u8(1)]
+	}
+	first.relocations << unit.Relocation{
+		offset:  0
+		place:   .section
+		section: '.pdata'
+		kind:    .rva
+		name:    'one'
+	}
+	mut second := defining('two', [u8(0xc3)])
+	second.sections << unit.Section{
+		name:      '.pdata'
+		kind:      .read_only
+		alignment: 4
+		data:      [u8(2), u8(2), u8(2), u8(2)]
+	}
+	second.relocations << unit.Relocation{
+		offset:  0
+		place:   .section
+		section: '.pdata'
+		kind:    .rva
+		name:    'two'
+	}
+	merged := merge_program([first, second], options(''))!
+	assert merged.sections.len == 1
+	assert merged.sections[0].name == '.pdata'
+	assert merged.sections[0].data == [u8(1), u8(1), u8(1), u8(1), u8(2), u8(2), u8(2), u8(2)]
+	mut named := []unit.Relocation{}
+	for relocation in merged.relocations {
+		if relocation.place == .section {
+			named << relocation
+		}
+	}
+	assert named.len == 2
+	assert named[0].offset == 0
+	assert named[1].offset == 4
+	assert named[1].section == '.pdata'
+}
+
+fn test_two_units_that_disagree_about_a_section_s_kind_are_refused() {
+	mut first := defining('one', [u8(0xc3)])
+	first.sections << unit.Section{
+		name: '.pdata'
+		kind: .read_only
+		data: [u8(1)]
+	}
+	mut second := defining('two', [u8(0xc3)])
+	second.sections << unit.Section{
+		name: '.pdata'
+		kind: .data
+		data: [u8(2)]
+	}
+	merge([first, second], options('')) or {
+		assert err.msg().contains('.pdata')
+		return
+	}
+	assert false, 'one section cannot be read-only data in one unit and writable data in another'
+}

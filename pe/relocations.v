@@ -38,6 +38,7 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 			.text { '.text' }
 			.read_only { '.rdata' }
 			.data { '.data' }
+			.section { relocation.section }
 			.tls {
 				return error('a relocation lies in thread-local storage, and the PE writer places none')
 			}
@@ -74,12 +75,26 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 					i64(machine.load_base) + place + relocation.addend
 				}
 			}
+			.rva {
+				// An image-relative address: the same number `absolute`
+				// writes with the image's base left out. A field of one is
+				// never a base relocation site, because nothing in it changes
+				// when the loader moves the image.
+				i64(place) + relocation.addend
+			}
 			.tpoff {
 				return error('a thread pointer offset reference to ${relocation.name} is left for a later version, which places thread-local storage')
 			}
 		}
 		if width == 4 {
-			if value < -2147483648 || value > 2147483647 {
+			// A relative field is signed and a written address is not: an
+			// absolute 32-bit value runs to 4 GB-1, while a displacement only
+			// has to fit a signed word.
+			if relocation.kind == .absolute || relocation.kind == .rva {
+				if value < 0 || value > 4294967295 {
+					return error('the reference to ${relocation.name} at ${field} is ${value}, which a four-byte address does not hold')
+				}
+			} else if value < -2147483648 || value > 2147483647 {
 				return error('the reference to ${relocation.name} at ${field} is ${value}, which a four-byte field does not hold')
 			}
 			put_u32(mut layout.sections[index].data, relocation.offset, u32(value & 0xffffffff))
@@ -119,6 +134,13 @@ fn reference(program unit.Program, layout Layout, plan ImportPlan, name string) 
 		}
 		data := layout.address('.data') or { return error('.data is not a section of this image') }
 		return data + definition.offset
+	}
+	// A reference may name a section of this image rather than a symbol in it,
+	// which is how a COFF object's unwind entry points at `.xdata`: the object
+	// writes a relocation against the section symbol and the section has no
+	// symbol of its own in the image.
+	if section_rva := layout.address(name) {
+		return section_rva
 	}
 	if name in program.labels {
 		text := layout.address('.text') or { return error('.text is not a section of this image') }

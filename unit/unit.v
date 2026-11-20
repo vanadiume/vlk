@@ -111,7 +111,14 @@ pub:
 	// another of the three for a reference that a section of read-only or
 	// writable data carries: an unwind table refers to the code from a section
 	// of its own, and the field moves with its own blob when the units merge.
+	// A reference inside a named section has `.section` here and the section's
+	// name below, because a container that keeps that section keeps its
+	// references with it rather than merging them into a blob.
 	place RelocationPlace = .text
+	// section is the name of the named section the field lies in, and empty
+	// for every other place. The offset counts from that section's first byte
+	// in the merged output, not from a blob base.
+	section string
 	// kind is how the name is reached. A direct reference uses the address of
 	// what the name stands for. A `.got` one uses the address of the global
 	// offset table's slot for the name, which is what a position-independent
@@ -148,6 +155,10 @@ pub enum RelocationPlace {
 	read_only
 	tls
 	data
+	// section is a field in one of the unit's named sections, whose name the
+	// relocation carries. It is how a COFF object's unwind data refers to the
+	// code: the field lives in `.pdata`, which no blob holds.
+	section
 }
 
 // RelocationKind is how a relocatable reference reaches what it names: the
@@ -158,6 +169,11 @@ pub enum RelocationKind {
 	got
 	absolute
 	tpoff
+	// rva writes an address relative to the image's base rather than its
+	// absolute value, which is what a PE image's exception data, load config
+	// and resource table carry. It is the same number `absolute` would write
+	// with the base left out, so a field of it never needs a base relocation.
+	rva
 }
 
 // Import is one name an image needs from a library, with the library the object
@@ -177,6 +193,37 @@ pub:
 	hint       u16
 	ordinal    u16
 	by_ordinal bool
+}
+
+// SectionKind is what a named section holds, which is what a container has to
+// say about it: whether the bytes are code, read-only data, writable data, or a
+// record only a debugger reads. The three blobs of a program carry the same fact
+// in their names; a named section is the shape a relocatable object brings when
+// its section has a name the image keeps.
+pub enum SectionKind {
+	code
+	read_only
+	data
+	// debug is read-only data a loader does not have to keep, which is what a
+	// `.debug$S` section of a COFF object is: a container may mark it
+	// discardable and nothing that runs reads it.
+	debug
+}
+
+// Section is one named contribution to an image: a section whose name the
+// container keeps, with its bytes and the alignment its first byte needs.
+//
+// It is what the three blobs cannot express. A PE image maps named sections at
+// addresses a linker assigns, so `.pdata` and `.xdata` are not part of the code
+// blob and their references are measured inside their own section. A unit read
+// from a COFF object fills this list; this compiler's own emitter leaves it
+// empty, and a container that cannot place a section refuses it by name.
+pub struct Section {
+pub mut:
+	name      string
+	data      []u8
+	alignment int
+	kind      SectionKind
 }
 
 // Definition is where a name that another translation unit of the same link
@@ -334,6 +381,11 @@ pub mut:
 	// and another names it, and a reference to it has to land on the bytes the
 	// definition wrote rather than on bytes of the same name.
 	read_only_globals map[string]GlobalSlot
+	// sections are the unit's named sections, which a container that keeps
+	// section names places by that name rather than merging into a blob. A
+	// unit this compiler's emitter wrote has none, and every reference it left
+	// is in one of the four places.
+	sections []Section
 	// globals_alignment is the strictest alignment any top-level object asked
 	// for with `__attribute__((aligned(N)))`, and zero when none did. The
 	// storage of the objects has to start at it for an object whose

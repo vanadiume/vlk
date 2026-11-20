@@ -367,6 +367,13 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 	// is missing instead of taking the process down inside an encoding.
 	machine.check_encoders()!
 	check_kind(program, kind)!
+	// A named section is what a container that maps sections by name keeps, and
+	// this one maps segments built from three blobs. Refusing here means a link
+	// that read a COFF object for an ELF target stops by name rather than
+	// writing an image with the section's bytes left out.
+	if program.sections.len > 0 {
+		return error("the program carries ${program.sections.len} named sections, and an ELF image is built from the unit's three blobs: a named section is a PE image's shape")
+	}
 	shared := kind == .shared
 	// A shared object and a position-independent executable are placed by
 	// whoever loads them, so this module adds no base to anything: every address
@@ -1872,6 +1879,10 @@ fn relocation_section(sections Sections, place unit.RelocationPlace) int {
 		.read_only { sections.strings }
 		.tls { sections.tls }
 		.data { sections.globals }
+		// A named section is a PE image's shape, and a program that carries
+		// one never reaches this writer: `write_options` refuses it by name
+		// before a byte is written.
+		.section { -1 }
 	}
 }
 
@@ -2019,6 +2030,12 @@ fn relocation_value(program unit.Program, sections Sections, base u64, extra []s
 		}
 		.tpoff {
 			return tpoff_of(program, relocation.name, relocation.addend)!
+		}
+		.rva {
+			// An image-relative field is a PE image's number. A program that
+			// carries one is refused before this writer runs, so this arm is
+			// here to keep the match complete rather than to answer.
+			return error('${relocation.name} is written as an image-relative address, which an ELF image has no form of')
 		}
 	}
 }

@@ -192,7 +192,16 @@ pub fn merge(units []unit.Program, options Options) !Merged {
 	// a relocatable object reaches a library function with a direct branch, and
 	// a direct branch cannot read the value a slot holds, so the container gives
 	// each such name a stub and the call goes there instead.
+	sections, section_bases := merge_sections(units)!
 	merged_relocations := merge_relocations(units, layout)
+	merged_relocations_named := merge_named_relocations(units, section_bases)
+	// The two lists are one list in the container: a reference is a reference
+	// whatever place its field lies in, and the writer looks up the section it
+	// named. The named ones come last so the blob references keep the order
+	// they were read in.
+	mut all_relocations := []unit.Relocation{cap: merged_relocations.len + merged_relocations_named.len}
+	all_relocations << merged_relocations
+	all_relocations << merged_relocations_named
 	mut plts := []string{}
 	for relocation in merged_relocations {
 		// A reference that goes through the global offset table reads the
@@ -278,7 +287,8 @@ pub fn merge(units []unit.Program, options Options) !Merged {
 		bound:                bound
 		fixups:               merge_fixups(units, layout)
 		data_fixups:          merge_data_fixups(units, layout, names.definitions)
-		relocations:          merged_relocations
+		relocations:          all_relocations
+		sections:             sections
 		plts:                 plts
 		tls_blob:             tls.blob
 		tls_size:             tls.size
@@ -781,6 +791,84 @@ fn merge_read_only_globals(units []unit.Program, layout place.Layout, definition
 		}
 	}
 	return globals
+}
+
+// merge_sections concatenates every unit's named sections by name, in the order
+// a name first appears, each unit's part at the alignment its section asked for.
+// A name two units give different kinds is refused: one of them is wrong, and an
+// image that placed the bytes under one answer would be lying to the other.
+//
+// The second answer is where each unit's part of a section starts, because a
+// reference inside a named section is measured from its own unit's part and has
+// to move with it.
+fn merge_sections(units []unit.Program) !([]unit.Section, []map[string]int) {
+	mut at := map[string]int{}
+	mut out := []unit.Section{}
+	mut bases := []map[string]int{cap: units.len}
+	for _, part in units {
+		mut unit_bases := map[string]int{}
+		for section in part.sections {
+			if section.name !in at {
+				at[section.name] = out.len
+				out << unit.Section{
+					name:      section.name
+					kind:      section.kind
+					alignment: section.alignment
+				}
+			}
+			index := at[section.name]
+			mut merged := out[index]
+			if merged.kind != section.kind {
+				return error('section ${section.name} holds ${merged.kind} in one unit and ${section.kind} in another')
+			}
+			alignment := if section.alignment > 1 { section.alignment } else { 1 }
+			for merged.data.len % alignment != 0 {
+				merged.data << u8(0)
+			}
+			unit_bases[section.name] = merged.data.len
+			merged.data << section.data
+			if section.alignment > merged.alignment {
+				merged.alignment = section.alignment
+			}
+			out[index] = merged
+		}
+		bases << unit_bases
+	}
+	return out, bases
+}
+
+// merge_named_relocations moves each reference inside a named section by the
+// place its unit's part of that section landed at. Unlike the three blobs, the
+// section moves as a whole, so a reference inside it keeps its offset inside the
+// section and the section's own address is the writer's to add.
+fn merge_named_relocations(units []unit.Program, bases []map[string]int) []unit.Relocation {
+	mut count := 0
+	for part in units {
+		for relocation in part.relocations {
+			if relocation.place == .section {
+				count++
+			}
+		}
+	}
+	mut out := []unit.Relocation{cap: count}
+	for i, part in units {
+		for relocation in part.relocations {
+			if relocation.place != .section {
+				continue
+			}
+			base := bases[i][relocation.section] or { continue }
+			out << unit.Relocation{
+				offset:  relocation.offset + base
+				place:   .section
+				section: relocation.section
+				kind:    relocation.kind
+				name:    relocation.name
+				addend:  relocation.addend
+				width:   relocation.width
+			}
+		}
+	}
+	return out
 }
 
 // merge_fixups sizes the merged reference list once and has each unit append its

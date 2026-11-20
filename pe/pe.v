@@ -156,6 +156,26 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 			alignment:       4
 		}
 	}
+	// The unit's named sections follow the blobs. A name the writer already
+	// gave a section to is refused rather than duplicated, because two
+	// sections of one name in an image is a file no loader can map by name.
+	for section in program.sections {
+		if section.name in ['.text', '.rdata', '.data', '.idata', '.reloc'] {
+			return error('the program carries a named section ${section.name}, which is a name the writer gives to a section it builds from the blobs')
+		}
+		if section.name == '' {
+			return error('the program carries a named section with no name')
+		}
+		if section.data.len == 0 {
+			continue
+		}
+		sections << Section{
+			name:            section.name
+			data:            section.data.clone()
+			characteristics: section_characteristics(section.kind)
+			alignment:       if section.alignment > 0 { section.alignment } else { 4 }
+		}
+	}
 	mut layout := lay(sections, machine)
 	// The import directory's own addresses are inside the section that holds
 	// it, so its bytes are written once the layout has said where that is.
@@ -164,6 +184,15 @@ pub fn write(program unit.Program, machine target.Target, kind Kind) ![]u8 {
 		layout.replace('.idata', plan.bytes(idata_rva))!
 	}
 	sites := relocate(mut layout, program, machine, plan)!
+	// The loader binary-searches the exception table, so its entries are sorted
+	// by the address they start at. The sort has to happen after the
+	// relocations, because until then the addresses are the ones the object
+	// left rather than the ones the image has.
+	if index := layout.index('.pdata') {
+		mut entries := layout.sections[index].data.clone()
+		sort_exception_entries(mut entries)!
+		layout.sections[index].data = entries
+	}
 	if sites.len > 0 {
 		reloc := base_relocations(sites)
 		layout.append(Section{
@@ -354,6 +383,17 @@ fn headers(program unit.Program, machine target.Target, layout Layout, plan Impo
 		put_u32(mut bytes, directories + 96, u32(idata + plan.first_iat()))
 		put_u32(mut bytes, directories + 100, u32(plan.iat_size()))
 	}
+	// The resource directory and the exception table are sections the input
+	// brought, so the header names where the layout put them and nothing here
+	// reads what they hold.
+	if resources := layout.address('.rsrc') {
+		put_u32(mut bytes, directories + 2 * 8, u32(resources))
+		put_u32(mut bytes, directories + 2 * 8 + 4, u32(layout.size_of('.rsrc')))
+	}
+	if exceptions := layout.address('.pdata') {
+		put_u32(mut bytes, directories + 3 * 8, u32(exceptions))
+		put_u32(mut bytes, directories + 3 * 8 + 4, u32(layout.size_of('.pdata')))
+	}
 	if reloc := layout.address('.reloc') {
 		put_u32(mut bytes, directories + 5 * 8, u32(reloc))
 		put_u32(mut bytes, directories + 5 * 8 + 4, u32(layout.size_of('.reloc')))
@@ -376,6 +416,58 @@ fn headers(program unit.Program, machine target.Target, layout Layout, plan Impo
 		put(mut bytes, section.raw_offset, section.data)
 	}
 	return bytes
+}
+
+// section_characteristics is what a named section's kind means to a loader.
+// Code is executable and readable, read-only data is neither executable nor
+// writable, writable data is both readable and writable, and a debug record is
+// readable and marked so the loader may drop it.
+fn section_characteristics(kind unit.SectionKind) u32 {
+	return match kind {
+		.code { scn_cnt_code | scn_mem_execute | scn_mem_read }
+		.read_only { scn_cnt_initialized_data | scn_mem_read }
+		.data { scn_cnt_initialized_data | scn_mem_read | scn_mem_write }
+		.debug { scn_cnt_initialized_data | scn_mem_read | scn_mem_discardable }
+	}
+}
+
+// ExceptionEntry is one record of the exception table: the address the function
+// starts at, and the three words that name its range and its unwind data.
+struct ExceptionEntry {
+	start u32
+	bytes []u8
+}
+
+// sort_exception_entries orders the exception table by the address each entry
+// starts at. Every entry is twelve bytes: the function's start, its end, and
+// where its unwind information is. A table that is not a whole number of entries
+// is refused, because sorting it would place the next section's bytes inside an
+// entry.
+fn sort_exception_entries(mut data []u8) ! {
+	if data.len % 12 != 0 {
+		return error('the exception table is ${data.len} bytes, and every entry is twelve')
+	}
+	mut entries := []ExceptionEntry{cap: data.len / 12}
+	for at := 0; at < data.len; at += 12 {
+		entries << ExceptionEntry{
+			start: u32(read_u32(data, at))
+			bytes: data[at..at + 12].clone()
+		}
+	}
+	entries.sort(a.start < b.start)
+	for i, entry in entries {
+		for j, byte in entry.bytes {
+			data[i * 12 + j] = byte
+		}
+	}
+}
+
+fn read_u32(bytes []u8, at int) int {
+	mut value := u32(0)
+	for i in 0 .. 4 {
+		value |= u32(bytes[at + i]) << (8 * i)
+	}
+	return int(value)
 }
 
 // align_up rounds a number up to a multiple of an alignment. Every size the
