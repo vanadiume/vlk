@@ -160,6 +160,25 @@ pub enum RelocationKind {
 	tpoff
 }
 
+// Import is one name an image needs from a library, with the library the object
+// that asked for it named. ELF records a name and leaves the library to the
+// image's needed list, because the loader searches the objects the image names;
+// PE records the DLL beside every name, because the loader reads the table that
+// way. One unit carries both views of the same names: `imports` for the flat
+// list the ELF path reads, and `imports_by_library` for the PE writer.
+//
+// `hint` is a guess at where the name sits in the DLL's export table, which only
+// saves the loader a search, and `ordinal` is the export number when the object
+// asked for the name by number rather than by name.
+pub struct Import {
+pub:
+	name       string
+	library    string
+	hint       u16
+	ordinal    u16
+	by_ordinal bool
+}
+
 // Definition is where a name that another translation unit of the same link
 // defines lives in the image being built: a function's offset in the code, or a
 // top-level object's offset in the writable data. The emitter cannot know it,
@@ -263,6 +282,11 @@ pub mut:
 	// imports are the library symbols the image needs, in the order they were
 	// first called, so that the same input produces the same bytes every run.
 	imports []string
+	// imports_by_library is the same names grouped the way a PE image records
+	// them: the DLL each one comes from, and the hint or ordinal the object
+	// stated. A unit read from an ELF object leaves it empty, because an ELF
+	// import names no library of its own.
+	imports_by_library []Import
 	// object_imports are the names in `imports` that name an object rather than
 	// a function: an `extern` object another translation unit defines. The
 	// symbol is undefined either way, and the type it is given says what a
