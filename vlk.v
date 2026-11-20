@@ -256,6 +256,21 @@ pub fn merge(units []unit.Program, options Options) !Merged {
 			copies << name
 		}
 	}
+	// The library beside each import travels with it, because a container that
+	// records one per name (a PE image) cannot get it from the flat list. Two
+	// units naming one import from two libraries is not a choice a merge can
+	// make, so the first record wins and the writer asks for that one.
+	mut imports_by_library := []unit.Import{}
+	mut import_libraries := map[string]bool{}
+	for part in units {
+		for record in part.imports_by_library {
+			if record.name in import_libraries {
+				continue
+			}
+			import_libraries[record.name] = true
+			imports_by_library << record
+		}
+	}
 	labels := merge_labels(units, layout, names.definitions)
 	place_of_entry := entry_place_of(units, layout, labels, options.entry)
 	mut merged := unit.Program{
@@ -279,6 +294,7 @@ pub fn merge(units []unit.Program, options Options) !Merged {
 		hidden:               names.hidden
 		internal:             names.internal
 		imports:              names.imports
+		imports_by_library:   imports_by_library
 		object_imports:       names.object_imports
 		weak_imports:         names.weak_imports
 		tls_slots:            names.tls_slots
@@ -430,6 +446,13 @@ pub fn link_files(paths []string, options Options) !Report {
 // `libm.so.6` in the image and `/usr/lib/libm.so` on this machine, and the two
 // are different strings for one library.
 fn settled(merged Merged, options Options) !unit.Program {
+	// A PE import names the DLL it comes from in the import table, so the
+	// question this check asks is already answered: no search of this machine's
+	// libraries decides what a Windows image imports, and an import with no
+	// library recorded is refused by the writer that would have to record it.
+	if options.target.format == .pe {
+		return merged.program
+	}
 	dirs := library.search_dirs(options.library_dirs, options.target.library_dirs)
 	// A link with no default libraries names no C library in its image, so that
 	// library answers nothing for its imports: a name only it defines is as

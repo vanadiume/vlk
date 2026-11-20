@@ -1,5 +1,6 @@
 module vlk
 
+import vanadiume.vlk.coff
 import vanadiume.vlk.elf
 import vanadiume.vlk.input
 import vanadiume.vlk.library
@@ -761,4 +762,137 @@ fn test_a_thread_local_from_a_coff_object_is_read_from_the_thread_s_copy() {
 	os.setenv('WINEDEBUG', '-all', true)
 	run := os.exec(['/usr/bin/wine', image])
 	assert run.exit_code == 7, 'wine left with ${run.exit_code}: ${run.output}'
+}
+
+// CallSite is where one call's displacement lies and the import it reaches.
+struct CallSite {
+	field int
+	name  string
+}
+
+// A resource is bytes a resource compiler produced and a directory that indexes
+// them; a linker carries both and names the directory, and the loader is what
+// finds a resource in it. The test links a `.rsrc` object that a resource
+// compiler wrote next to a program that asks the loader for one of its entries
+// and exits with the entry's length, so what is checked is the resource being
+// found at run time rather than the bytes being present.
+fn test_a_resource_a_resource_compiler_wrote_is_found_by_the_loader() {
+	windres := '/usr/bin/x86_64-w64-mingw32-windres'
+	if !os.exists(windres) {
+		eprintln('skipping: no windres on this machine to write a resource object with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('resource')
+	os.mkdir_all(dir) or { panic(err) }
+	script := os.join_path(dir, 'app.rc')
+	// One RCDATA entry under the name 1. A resource compiler writes each number
+	// of an RCDATA list as a sixteen-bit word, so the entry is eight bytes and
+	// that is the length the program asks the loader for.
+	os.write_file(script, '1 RCDATA { 1, 2, 3, 4 }\n') or { panic(err) }
+	resource_object := os.join_path(dir, 'app.res.o')
+	written := os.exec([windres, script, '-O', 'coff', '-o', resource_object])
+	if written.exit_code != 0 {
+		eprintln('skipping: windres could not write the resource object: ${written.output}')
+		return
+	}
+	resource := coff.read_unit(os.read_bytes(resource_object) or { panic(err) }, target.windows_x86_64())!
+	// The program asks the loader for the resource and exits with its length:
+	// FindResourceW(NULL, 1, RT_RCDATA) then SizeofResource(NULL, handle).
+	mut part := unit.Program{}
+	part.text = [
+		u8(0x48),
+		u8(0x83),
+		u8(0xec),
+		u8(0x28), // sub rsp, 0x28
+		u8(0x31),
+		u8(0xc9), // xor ecx, ecx
+		u8(0xba),
+		u8(1),
+		u8(0),
+		u8(0),
+		u8(0), // mov edx, 1
+		u8(0x41),
+		u8(0xb8),
+		u8(10),
+		u8(0),
+		u8(0),
+		u8(0), // mov r8d, 10 (RT_RCDATA)
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + FindResourceW]
+		u8(0x48),
+		u8(0x89),
+		u8(0xc2), // mov rdx, rax
+		u8(0x31),
+		u8(0xc9), // xor ecx, ecx
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + SizeofResource]
+		u8(0x89),
+		u8(0xc1), // mov ecx, eax
+		u8(0xff),
+		u8(0x15),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call [rip + ExitProcess]
+		u8(0x48),
+		u8(0x83),
+		u8(0xc4),
+		u8(0x28),
+		u8(0xc3),
+	]
+	part.labels['main'] = 0
+	part.defined['main'] = true
+	part.entry_place = 0
+	for name in ['FindResourceW', 'SizeofResource', 'ExitProcess'] {
+		part.imports << name
+		part.imports_by_library << unit.Import{
+			name:    name
+			library: 'kernel32.dll'
+		}
+	}
+	for call in [
+		CallSite{
+			field: 19
+			name:  'FindResourceW'
+		},
+		CallSite{
+			field: 30
+			name:  'SizeofResource'
+		},
+		CallSite{
+			field: 38
+			name:  'ExitProcess'
+		},
+	] {
+		part.relocations << unit.Relocation{
+			offset: call.field
+			place:  .text
+			kind:   .direct
+			name:   call.name
+			addend: -4
+			width:  .narrow
+		}
+	}
+	image := os.join_path(dir, 'resource.exe')
+	bytes := link([resource, part], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+	})!
+	os.write_file_array(image, bytes) or { panic(err) }
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 8, 'wine left with ${result.exit_code}: ${result.output}'
 }
