@@ -364,6 +364,12 @@ pub mut:
 	// stated. A unit read from an ELF object leaves it empty, because an ELF
 	// import names no library of its own.
 	imports_by_library []Import
+	// default_libraries are the libraries an object asked for in its own
+	// directives, which is how `#pragma comment(lib, ...)` reaches a linker.
+	// They are read while the object is read and consumed by the read that
+	// follows; the merge never needs them, and a program a caller builds has
+	// none.
+	default_libraries []string
 	// object_imports are the names in `imports` that name an object rather than
 	// a function: an `extern` object another translation unit defines. The
 	// symbol is undefined either way, and the type it is given says what a

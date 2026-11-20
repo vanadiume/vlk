@@ -1057,3 +1057,44 @@ fn test_a_call_to_an_import_without_dllimport_gets_a_thunk() {
 	result := os.exec(['/usr/bin/wine', image])
 	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
 }
+
+// An object that names a library in its own directives gets it whether or not
+// the command line does. clang writes `#pragma comment(lib, ...)` into
+// `.drectve`, and the read resolves that name beside the object that asked for
+// it, so a build that passed only the object still links and runs.
+fn test_a_library_an_object_asks_for_is_found_beside_it() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write a COFF object with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('defaultlib')
+	os.mkdir_all(dir) or { panic(err) }
+	source := os.join_path(dir, 'asked.c')
+	os.write_file(source, '#pragma comment(lib, "kernel32.lib")\nvoid ExitProcess(unsigned int code);\nint main(void) { ExitProcess(42); return 1; }\n') or {
+		panic(err)
+	}
+	object := os.join_path(dir, 'asked.obj')
+	written := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', source, '-o', object])
+	if written.exit_code != 0 {
+		eprintln('skipping: clang could not write the object: ${written.output}')
+		return
+	}
+	// The library stands beside the object and is named nowhere on the link.
+	os.write_file_array(os.join_path(dir, 'kernel32.lib'), import_library('ExitProcess',
+		'kernel32.dll', 'ExitProcess')) or { panic(err) }
+	image := os.join_path(dir, 'asked.exe')
+	link_files([object], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+}

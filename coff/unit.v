@@ -290,6 +290,13 @@ fn read_directives(file File, mut program unit.Program) ! {
 			if option == '' {
 				continue
 			}
+			if option.starts_with('/DEFAULTLIB:') {
+				name := option.all_after('/DEFAULTLIB:').trim('"')
+				if name != '' && name !in program.default_libraries {
+					program.default_libraries << name
+				}
+				continue
+			}
 			if option.starts_with('/EXPORT:') {
 				name := option.all_after('/EXPORT:').all_before(',')
 				if name != '' {

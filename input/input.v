@@ -160,6 +160,32 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 	// because the two are not the same list: `/usr/lib/libc.so` is a script that
 	// reads `GROUP ( libc.so.6  libc_nonshared.a )`, and `atexit` is in the
 	// archive rather than in the shared object the script names first.
+	// An object can ask for a library in its own directives, which is how a
+	// `#pragma comment(lib, ...)` reaches a linker. The name is resolved against
+	// the directories the link was given and beside the object that asked, and
+	// what it finds is read the way a path on the command line is: a short import
+	// member still travels as a record rather than as a unit.
+	mut from_directives := []string{}
+	mut asked := map[string]bool{}
+	for part in out.units {
+		for name in part.default_libraries {
+			if name in asked {
+				continue
+			}
+			asked[name] = true
+			from_directives << default_library(name, dirs, paths) or {
+				return error('${name} was asked for by an object, and no file of that name was found')
+			}
+		}
+	}
+	for path in from_directives {
+		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
+		parts := archive.read(bytes) or { return error('${path}: ${err.msg()}') }
+		members := pull(parts, path, machine, mut needed, mut provided, mut comdats, mut
+			import_libraries)!
+		out.pulled += members.len
+		out.units << members
+	}
 	if libraries.len > 0 {
 		for found in library.archive_libraries(libraries, dirs, static_link)! {
 			bytes := os.read_bytes(found.path) or { return error('${found.path}: ${err.msg()}') }
@@ -184,6 +210,36 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 		}
 	}
 	return out
+}
+
+// default_library finds the file a directive named. A librarian's spelling is
+// `foo.lib` and a caller often writes `foo`, so both are tried, in the
+// directories the link was given and then in the directory of every input. A
+// name that is itself a path is taken as it stands.
+fn default_library(name string, dirs []string, paths []string) !string {
+	mut candidates := [name]
+	if !name.ends_with('.lib') && !name.ends_with('.a') {
+		candidates << '${name}.lib'
+	}
+	if os.exists(name) {
+		return name
+	}
+	mut roots := dirs.clone()
+	for path in paths {
+		dir := os.dir(path)
+		if dir != '' && dir !in roots {
+			roots << dir
+		}
+	}
+	for root in roots {
+		for candidate in candidates {
+			path := os.join_path(root, candidate)
+			if os.exists(path) {
+				return path
+			}
+		}
+	}
+	return error('no file named ${name} in the search directories')
 }
 
 // stamp_imports records the library an imported name comes from on the unit that
