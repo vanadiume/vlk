@@ -54,13 +54,14 @@ fn exiting(status u8) unit.Program {
 	part.imports << 'ExitProcess'
 	part.imports_by_library << unit.Import{
 		name:    'ExitProcess'
+		symbol:  '__imp_ExitProcess'
 		library: 'kernel32.dll'
 	}
 	part.relocations << unit.Relocation{
 		offset: 11
 		place:  .text
 		kind:   .direct
-		name:   'ExitProcess'
+		name:   '__imp_ExitProcess'
 		addend: -4
 		width:  .narrow
 	}
@@ -132,16 +133,88 @@ fn test_a_reader_that_knows_nothing_of_this_tree_agrees_on_the_headers() {
 	assert output.contains('.idata')
 }
 
-fn test_the_import_slot_is_where_the_call_says_it_is() {
+fn test_a_call_through_a_slot_reaches_the_import_address_table() {
 	windows := target.windows_x86_64()
 	image := write(exiting(42), windows, .executable)!
-	// The call's field is at offset 11 of the text, and it holds the slot's
-	// address minus the end of the field: `call [rip + d]` reaches the slot.
+	// The instruction is `call [rip + disp]`, the shape a compiler writes when
+	// it saw `dllimport`, and its displacement points at the address table's
+	// first entry: the loader writes the function's address there.
 	field := 0x1000 + 11
-	slot := first_thunk(image)
-	assert slot > 0
 	written := i32(u32_at(image, raw_offset(image, field)))
-	assert written == i32(slot - (field + 4)), 'the call points at ${written} and the slot is at ${slot - (field + 4)}'
+	slot := first_thunk(image)
+	assert int(field) + 4 + int(written) == slot, 'the call points at ${int(field) + 4 + int(written)} and the slot is at ${slot}'
+}
+
+// exit_by_call is a program whose call to the import is direct: `call rel32`,
+// which is what a compiler writes without `dllimport`. The callee's address is
+// not known until the image is mapped, so the call reaches a thunk at the end of
+// the code and the thunk jumps through the slot.
+fn exit_by_call(status u8) unit.Program {
+	mut part := unit.Program{}
+	part.text = [
+		u8(0x48),
+		u8(0x83),
+		u8(0xec),
+		u8(0x28), // sub rsp, 0x28
+		u8(0xb9),
+		status,
+		u8(0),
+		u8(0),
+		u8(0), // mov ecx, status
+		u8(0xe8),
+		u8(0),
+		u8(0),
+		u8(0),
+		u8(0), // call ExitProcess
+		u8(0x48),
+		u8(0x83),
+		u8(0xc4),
+		u8(0x28), // add rsp, 0x28
+		u8(0xc3), // ret
+	]
+	part.labels['main'] = 0
+	part.defined['main'] = true
+	part.entry_place = 0
+	part.imports << 'ExitProcess'
+	part.imports_by_library << unit.Import{
+		name:    'ExitProcess'
+		library: 'kernel32.dll'
+	}
+	part.relocations << unit.Relocation{
+		offset: 10
+		place:  .text
+		kind:   .direct
+		name:   'ExitProcess'
+		addend: -4
+		width:  .narrow
+	}
+	return part
+}
+
+fn test_a_direct_call_reaches_a_thunk_that_jumps_through_the_slot() {
+	windows := target.windows_x86_64()
+	image := write(exit_by_call(42), windows, .executable)!
+	// The direct call's field is at offset 10, and it holds the distance to a
+	// thunk: six bytes of code that jump through the import's slot.
+	field := 0x1000 + 10
+	written := i32(u32_at(image, raw_offset(image, field)))
+	reached := i32(field + 4) + written
+	at := raw_offset(image, int(reached))
+	assert at > 0
+	assert image[at] == u8(0xff), 'the call points at ${reached}, and a thunk begins with 0xff'
+	assert image[at + 1] == u8(0x25), 'the thunk jumps through a slot'
+	slot := first_thunk(image)
+	thunk_disp := i32(u32_at(image, at + 2))
+	assert int(reached) + 6 + thunk_disp == slot, 'the thunk points at ${int(reached) + 6 + thunk_disp} and the slot is at ${slot}'
+	path := os.join_path(scratch_dir(), 'thunk.exe')
+	os.write_file_array(path, image) or { panic(err) }
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping the run: no wine on this machine')
+		return
+	}
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', path])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
 }
 
 // first_thunk is the address table of the first DLL in the import directory,
@@ -156,6 +229,16 @@ fn first_thunk(image []u8) int {
 	return int(u32_at(image, at))
 }
 
+fn u16_at(bytes []u8, at int) u16 {
+	return u16(bytes[at]) | (u16(bytes[at + 1]) << 8)
+}
+
+// Thread-local storage is the one place a PE image tells the loader to make a
+// copy per thread. The image holds the template, a four-byte slot for the index
+// the loader hands out, and a directory naming both; the code reads the index,
+// walks the thread's own array out of the TEB, and exits with the value it found.
+// Running it is the whole check: an index the loader never wrote, or a template
+// it never copied, leaves a status that is not the one the template holds.
 // raw_offset turns an address in an image into an offset in the file, by finding
 // the section that holds the address in the section table. A reader of this
 // tree's own image would be reading the writer's idea back; this walks the file
@@ -174,16 +257,6 @@ fn raw_offset(image []u8, rva int) int {
 	return -1
 }
 
-fn u16_at(bytes []u8, at int) u16 {
-	return u16(bytes[at]) | (u16(bytes[at + 1]) << 8)
-}
-
-// Thread-local storage is the one place a PE image tells the loader to make a
-// copy per thread. The image holds the template, a four-byte slot for the index
-// the loader hands out, and a directory naming both; the code reads the index,
-// walks the thread's own array out of the TEB, and exits with the value it found.
-// Running it is the whole check: an index the loader never wrote, or a template
-// it never copied, leaves a status that is not the one the template holds.
 fn test_a_thread_local_value_is_read_out_of_the_thread_s_copy() {
 	windows := target.windows_x86_64()
 	mut part := unit.Program{}
@@ -236,6 +309,7 @@ fn test_a_thread_local_value_is_read_out_of_the_thread_s_copy() {
 	part.imports << 'ExitProcess'
 	part.imports_by_library << unit.Import{
 		name:    'ExitProcess'
+		symbol:  '__imp_ExitProcess'
 		library: 'kernel32.dll'
 	}
 	part.relocations << unit.Relocation{
@@ -250,7 +324,7 @@ fn test_a_thread_local_value_is_read_out_of_the_thread_s_copy() {
 		offset: 29
 		place:  .text
 		kind:   .direct
-		name:   'ExitProcess'
+		name:   '__imp_ExitProcess'
 		addend: -4
 		width:  .narrow
 	}
@@ -577,17 +651,19 @@ fn calling_answer() unit.Program {
 	part.imports << 'ExitProcess'
 	part.imports_by_library << unit.Import{
 		name:    'answer'
+		symbol:  '__imp_answer'
 		library: 'answer.dll'
 	}
 	part.imports_by_library << unit.Import{
 		name:    'ExitProcess'
+		symbol:  '__imp_ExitProcess'
 		library: 'kernel32.dll'
 	}
 	part.relocations << unit.Relocation{
 		offset: 6
 		place:  .text
 		kind:   .direct
-		name:   'answer'
+		name:   '__imp_answer'
 		addend: -4
 		width:  .narrow
 	}
@@ -596,7 +672,7 @@ fn calling_answer() unit.Program {
 		offset: 14
 		place:  .text
 		kind:   .direct
-		name:   'ExitProcess'
+		name:   '__imp_ExitProcess'
 		addend: -4
 		width:  .narrow
 	}

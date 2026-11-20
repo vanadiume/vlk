@@ -58,13 +58,18 @@ struct ImportEntry {
 // already here.
 fn plan_imports(program unit.Program) !ImportPlan {
 	mut records := map[string]unit.Import{}
+	// A unit's needed names may be spelled either way: an object that saw
+	// `dllimport` needs `__imp_foo`, and one that did not needs `foo`, while the
+	// import library's record is keyed by the spelling its member defined. The
+	// exported name is kept as a second key so either list finds the record.
+	mut by_export := map[string]unit.Import{}
 	for record in program.imports_by_library {
-		// The record is found by the spelling this link's references use,
-		// which is the symbol an import library defined rather than the name
-		// the DLL exports.
 		key := if record.symbol != '' { record.symbol } else { record.name }
 		if key !in records {
 			records[key] = record
+		}
+		if record.name !in by_export {
+			by_export[record.name] = record
 		}
 	}
 	mut groups := map[string][]ImportEntry{}
@@ -74,7 +79,9 @@ fn plan_imports(program unit.Program) !ImportPlan {
 			continue
 		}
 		record := records[name] or {
-			return error('${name} is imported and no library is recorded for it')
+			by_export[name] or {
+				return error('${name} is imported and no library is recorded for it')
+			}
 		}
 		if record.library == '' {
 			return error('${name} is imported from a library with no name')

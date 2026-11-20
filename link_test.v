@@ -859,6 +859,7 @@ fn test_a_resource_a_resource_compiler_wrote_is_found_by_the_loader() {
 		part.imports << name
 		part.imports_by_library << unit.Import{
 			name:    name
+			symbol:  '__imp_${name}'
 			library: 'kernel32.dll'
 		}
 	}
@@ -880,7 +881,7 @@ fn test_a_resource_a_resource_compiler_wrote_is_found_by_the_loader() {
 			offset: call.field
 			place:  .text
 			kind:   .direct
-			name:   call.name
+			name:   '__imp_${call.name}'
 			addend: -4
 			width:  .narrow
 		}
@@ -1009,6 +1010,49 @@ fn test_an_import_library_names_the_dll_a_coff_object_needs() {
 		output: image
 	})!
 	assert report.units == 1
+	os.setenv('WINEDEBUG', '-all', true)
+	result := os.exec(['/usr/bin/wine', image])
+	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'
+}
+
+// A call to a DLL function written without `dllimport` is a direct call to the
+// name, and the name's address is one only the loader knows. A PE linker answers
+// it with a six-byte thunk that jumps through the import's slot, and that is what
+// the writer now places: the call reaches the thunk, the thunk reaches the slot,
+// and the program exits with the status it handed over.
+fn test_a_call_to_an_import_without_dllimport_gets_a_thunk() {
+	clang := '/usr/bin/clang'
+	if !os.exists(clang) {
+		eprintln('skipping: no clang on this machine to write a COFF object with')
+		return
+	}
+	if !os.exists('/usr/bin/wine') {
+		eprintln('skipping: no wine on this machine to run a PE image with')
+		return
+	}
+	dir := scratch('thunk')
+	os.mkdir_all(dir) or { panic(err) }
+	source := os.join_path(dir, 'exit.c')
+	os.write_file(source, 'void ExitProcess(unsigned int code);\nint main(void) { ExitProcess(42); return 1; }\n') or {
+		panic(err)
+	}
+	object := os.join_path(dir, 'exit.obj')
+	written := os.exec([clang, '--target=x86_64-pc-windows-msvc', '-c', source, '-o', object])
+	if written.exit_code != 0 {
+		eprintln('skipping: clang could not write the object: ${written.output}')
+		return
+	}
+	imports := os.join_path(dir, 'kernel32.lib')
+	os.write_file_array(imports, import_library('ExitProcess', 'kernel32.dll', 'ExitProcess')) or {
+		panic(err)
+	}
+	image := os.join_path(dir, 'thunk.exe')
+	link_files([object, imports], Options{
+		entry:  'main'
+		target: target.windows_x86_64()
+		kind:   .program
+		output: image
+	})!
 	os.setenv('WINEDEBUG', '-all', true)
 	result := os.exec(['/usr/bin/wine', image])
 	assert result.exit_code == 42, 'wine left with ${result.exit_code}: ${result.output}'

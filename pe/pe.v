@@ -159,10 +159,24 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 			return error('the thread-local template is ${program.tls_blob.len} bytes and the block is ${program.tls_size}')
 		}
 	}
+	// A direct call to an import reaches a thunk: six bytes that jump through
+	// the import's slot. The other shape, which a compiler picks when it sees
+	// `dllimport`, calls the slot itself; a call without it names the function,
+	// and a function lives at an address only the loader knows. The thunks go
+	// at the end of the code, so no byte the program already had moves.
+	mut thunks := map[string]int{}
+	mut code := program.text.clone()
+	for name in direct_import_names(program, plan) {
+		for code.len % 16 != 0 {
+			code << u8(0xcc)
+		}
+		thunks[name] = code.len
+		code << [u8(0xff), u8(0x25), u8(0), u8(0), u8(0), u8(0)]
+	}
 	mut sections := [
 		Section{
 			name:            '.text'
-			data:            program.text.clone()
+			data:            code
 			characteristics: scn_cnt_code | scn_mem_execute | scn_mem_read
 			alignment:       16
 		},
@@ -263,6 +277,20 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 		idata_rva := layout.address('.idata') or { return error('.idata was placed and the layout lost it') }
 		layout.replace('.idata', plan.bytes(idata_rva))!
 	}
+	// The thunks were written before the layout, so their displacements are
+	// filled in once both the code and the import table have addresses.
+	if thunks.len > 0 {
+		text_rva := layout.address('.text') or { return error('.text was placed and the layout lost it') }
+		idata_rva := layout.address('.idata') or { return error('.idata was placed and the layout lost it') }
+		index := layout.index('.text') or { return error('.text was placed and the layout lost it') }
+		for name, offset in thunks {
+			slot := plan.slots[name] or {
+				return error('${name} has a thunk and no import table entry')
+			}
+			disp := i64(idata_rva + slot) - i64(text_rva + offset + 6)
+			put_u32(mut layout.sections[index].data, offset + 2, u32(disp & 0xffffffff))
+		}
+	}
 	mut sites := []Site{}
 	if kind == .dll {
 		edata_rva := layout.address('.edata') or { return error('.edata was placed and the layout lost it') }
@@ -298,7 +326,7 @@ pub fn write_options(program unit.Program, machine target.Target, kind Kind, opt
 			kind: base_reloc_dir64
 		}
 	}
-	sites << relocate(mut layout, program, machine, plan, tls)!
+	sites << relocate(mut layout, program, machine, plan, tls, thunks)!
 	// The emitter's own references are instruction-shaped and the merge's are
 	// fields, and both are filled once the layout is settled.
 	sites << apply_fixups(mut layout, program, machine, plan, tls)!
@@ -598,6 +626,28 @@ fn tls_alignment_characteristics(alignment int) u32 {
 		code++
 	}
 	return u32(code + 1) << scn_align_shift
+}
+
+// direct_import_names is every imported name a reference reaches directly, in
+// the order the references were read. A `__imp_` name already names the slot, so
+// it needs no thunk: the instruction reads the slot itself.
+fn direct_import_names(program unit.Program, plan ImportPlan) []string {
+	mut seen := map[string]bool{}
+	mut names := []string{}
+	for relocation in program.relocations {
+		if relocation.kind != .direct {
+			continue
+		}
+		if relocation.name !in plan.slots || relocation.name.starts_with('__imp_') {
+			continue
+		}
+		if relocation.name in seen {
+			continue
+		}
+		seen[relocation.name] = true
+		names << relocation.name
+	}
+	return names
 }
 
 // export_table_entries is the program's export list as the table builder takes

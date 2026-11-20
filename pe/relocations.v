@@ -31,7 +31,7 @@ struct Site {
 
 // relocate fills every reference the program carries and answers the sites the
 // base relocation table has to cover.
-fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan, tls TlsInfo) ![]Site {
+fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan ImportPlan, tls TlsInfo, thunks map[string]int) ![]Site {
 	mut sites := []Site{}
 	for relocation in program.relocations {
 		section_name := match relocation.place {
@@ -66,7 +66,16 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 			put_u32(mut layout.sections[index].data, relocation.offset, u32(value & 0xffffffff))
 			continue
 		}
-		place := reference(program, layout, plan, tls, relocation.name)!
+		mut place := reference(program, layout, plan, tls, relocation.name)!
+		// A direct reference to an import reaches the thunk written for it
+		// rather than the slot: the slot holds an address only the loader
+		// knows, and a thunk is code that reads it.
+		if relocation.kind == .direct {
+			if thunk := thunks[relocation.name] {
+				text := layout.address('.text') or { return error('.text is not a section of this image') }
+				place = text + thunk
+			}
+		}
 		value := match relocation.kind {
 			.direct { i64(place) + relocation.addend - field }
 			.got {
