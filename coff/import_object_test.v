@@ -355,3 +355,15 @@ fn test_import_a_member_with_two_strings_exports_its_symbol() {
 	assert member.name == 'foo'
 	assert member.exported == ''
 }
+
+// An export number above 32767 is a legal ordinal, and a by-number member keeps
+// it in the whole Ordinal/Hint field. Masking the field for a hint would hand the
+// link a different export.
+fn test_import_an_ordinal_above_the_hint_mask_is_read_whole() {
+	mut spec := named_import('high', 'mylib.dll', import_code)
+	spec.name_type = 0
+	spec.ordinal_hint = 40000
+	member := read_import_member(build_import_member(spec))!
+	assert member.by_ordinal
+	assert member.hint == 40000
+}

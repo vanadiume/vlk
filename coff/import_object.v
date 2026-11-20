@@ -55,8 +55,8 @@ pub struct ImportMember {
 pub:
 	machine         u16
 	time_date_stamp u32
-	// hint is the low 15 bits of the Ordinal/Hint field, so an export
-	// ordinal above 32767 is not reported whole.
+	// hint is the Ordinal/Hint field: the export number when the member
+	// imports by number, and the hint a by-name member states in it.
 	hint u16
 	// by_ordinal says the member names an export number rather than a name.
 	// The format says so through the name type, and a member that sets the
@@ -174,11 +174,28 @@ pub fn read_import_member(bytes []u8) !ImportMember {
 		return error('the import member is type ${kind}, and the format defines code, data and const')
 	}
 	name_type := (type_info >> import_name_type_shift) & import_name_type_mask
+	// A member that imports by number keeps the number in the whole field. The
+	// mask is the hint a by-name member carries, and applying it here would
+	// truncate an export number above 32767 to a different export.
+	by_ordinal := (ordinal_hint & import_ordinal_bit) != 0 || name_type == import_name_ordinal
+	// Two spellings mark a by-number member. When the high bit is set it is a
+	// mark and the number is the low fifteen bits; when the member says so
+	// through its name type the field is the number itself, and that is the
+	// spelling a librarian writes, so an ordinal above 32767 is read whole.
+	hint := if name_type == import_name_ordinal {
+		// The name type states the whole field is the number, and an ordinal
+		// above 32767 has the high bit set without that meaning a mark.
+		ordinal_hint
+	} else if by_ordinal {
+		ordinal_hint & import_ordinal_mask
+	} else {
+		ordinal_hint
+	}
 	return ImportMember{
 		machine:         machine
 		time_date_stamp: time_date_stamp
-		hint:            ordinal_hint & import_ordinal_mask
-		by_ordinal:      (ordinal_hint & import_ordinal_bit) != 0 || name_type == import_name_ordinal
+		hint:            hint
+		by_ordinal:      by_ordinal
 		kind:            kind
 		name:            name
 		library:         library
