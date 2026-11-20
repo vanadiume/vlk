@@ -805,9 +805,22 @@ fn merge_sections(units []unit.Program) !([]unit.Section, []map[string]int) {
 	mut at := map[string]int{}
 	mut out := []unit.Section{}
 	mut bases := []map[string]int{cap: units.len}
-	for _, part in units {
+	mut comdats := map[string]int{}
+	for unit_index, part in units {
 		mut unit_bases := map[string]int{}
 		for section in part.sections {
+			if section.comdat != '' {
+				// One copy of a COMDAT group is kept and the rest discarded,
+				// and this link does not decide which yet. Refusing here is
+				// the difference between a link that stops and one that hands
+				// the loader two definitions of a name.
+				if owner := comdats[section.comdat] {
+					if owner != unit_index {
+						return error('the COMDAT group ${section.comdat} is carried by unit ${owner} and unit ${unit_index}, and this link does not select between copies')
+					}
+				}
+				comdats[section.comdat] = unit_index
+			}
 			if section.name !in at {
 				at[section.name] = out.len
 				out << unit.Section{
@@ -857,13 +870,21 @@ fn merge_named_relocations(units []unit.Program, bases []map[string]int) []unit.
 				continue
 			}
 			base := bases[i][relocation.section] or { continue }
+			// A reference whose target is itself a named section moves with
+			// that section's part, the way a reference into a blob moves with
+			// the blob: the object measured the byte from the start of its own
+			// copy, and the merged copy starts somewhere else.
+			mut addend := relocation.addend
+			if target := bases[i][relocation.name] {
+				addend += target
+			}
 			out << unit.Relocation{
 				offset:  relocation.offset + base
 				place:   .section
 				section: relocation.section
 				kind:    relocation.kind
 				name:    relocation.name
-				addend:  relocation.addend
+				addend:  addend
 				width:   relocation.width
 			}
 		}

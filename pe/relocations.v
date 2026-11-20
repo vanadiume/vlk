@@ -52,6 +52,20 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 			return error("a relocation at ${relocation.offset} in ${section_name} does not lie inside the section's ${size} bytes")
 		}
 		field := layout.sections[index].rva + relocation.offset
+		// A thread-local offset is not an address in the image: it is where the
+		// variable lies inside one thread's copy, which the unit's own labels
+		// hold, so it is answered before any section or symbol lookup.
+		if relocation.kind == .tls_offset {
+			offset := program.tls_labels[relocation.name] or {
+				return error('${relocation.name} is read as a thread-local and the image defines no thread-local of that name')
+			}
+			value := i64(offset) + relocation.addend
+			if value < -2147483648 || value > 2147483647 {
+				return error('the thread-local offset of ${relocation.name} is ${value}, which a four-byte field does not hold')
+			}
+			put_u32(mut layout.sections[index].data, relocation.offset, u32(value & 0xffffffff))
+			continue
+		}
 		place := reference(program, layout, plan, tls, relocation.name)!
 		value := match relocation.kind {
 			.direct { i64(place) + relocation.addend - field }
@@ -84,6 +98,11 @@ fn relocate(mut layout Layout, program unit.Program, machine target.Target, plan
 			}
 			.tpoff {
 				return error('a thread pointer offset reference to ${relocation.name} is left for a later version, which places thread-local storage')
+			}
+			.tls_offset {
+				// Answered above, before the name is looked up as an address;
+				// this arm only completes the match.
+				0
 			}
 		}
 		if width == 4 {

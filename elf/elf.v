@@ -2037,6 +2037,9 @@ fn relocation_value(program unit.Program, sections Sections, base u64, extra []s
 			// here to keep the match complete rather than to answer.
 			return error('${relocation.name} is written as an image-relative address, which an ELF image has no form of')
 		}
+		.tls_offset {
+			return error("${relocation.name} is written as an offset into a thread's thread-local copy, which is a Windows image's number")
+		}
 	}
 }
 

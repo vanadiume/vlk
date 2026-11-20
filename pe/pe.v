@@ -622,21 +622,22 @@ fn export_table_entries(exports []unit.Export, rva int) []Export {
 fn resolve_exports(program unit.Program, layout Layout) ![]Export {
 	mut out := []Export{cap: program.exports.len}
 	for export in program.exports {
-		rva := if export.function {
+		// Which kind of thing the name is decided here rather than by the
+		// caller, because a linker directive names an export and does not say
+		// whether it is code or storage. A label answers first, then the two
+		// kinds of object.
+		mut rva := 0
+		if offset := program.labels[export.name] {
 			text := layout.address('.text') or { return error('.text is not a section of this image') }
-			text + (program.labels[export.name] or {
-				return error('${export.name} is exported as a function and the image defines no code of that name')
-			})
+			rva = text + offset
+		} else if slot := program.read_only_globals[export.name] {
+			rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
+			rva = rdata + slot.offset
+		} else if slot := program.globals[export.name] {
+			data := layout.address('.data') or { return error('.data is not a section of this image') }
+			rva = data + slot.offset
 		} else {
-			if slot := program.read_only_globals[export.name] {
-				rdata := layout.address('.rdata') or { return error('.rdata is not a section of this image') }
-				rdata + slot.offset
-			} else if slot := program.globals[export.name] {
-				data := layout.address('.data') or { return error('.data is not a section of this image') }
-				data + slot.offset
-			} else {
-				return error('${export.name} is exported as an object and the image defines no storage of that name')
-			}
+			return error('${export.name} is exported and the image defines neither code nor storage of that name')
 		}
 		out << Export{
 			name:    export.name

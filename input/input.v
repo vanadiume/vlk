@@ -1,6 +1,7 @@
 module input
 
 import vanadiume.vlk.archive
+import vanadiume.vlk.coff
 import vanadiume.vlk.library
 import vanadiume.vlk.object
 import os
@@ -22,6 +23,10 @@ import vanadiume.vlk.unit
 // convention rather than a fact.
 pub enum Kind {
 	object
+	// coff_object is a COFF object: the file a Windows compiler writes, which
+	// is read by `coff/` rather than by `object/`. The two are told apart by
+	// their bytes, because a suffix is a convention rather than a fact.
+	coff_object
 	archive
 	library
 }
@@ -54,6 +59,9 @@ const et_dyn = u16(3)
 pub fn classify(bytes []u8, path string) !Kind {
 	if bytes.len >= ar_magic.len && bytes[..ar_magic.len].bytestr() == ar_magic {
 		return .archive
+	}
+	if coff.is_object(bytes) {
+		return .coff_object
 	}
 	if bytes.len >= elf_header_type_offset + 2 && bytes[..4] == elf_magic {
 		kind := u16(bytes[elf_header_type_offset]) | (u16(bytes[elf_header_type_offset + 1]) << 8)
@@ -114,8 +122,8 @@ pub fn read(paths []string, libraries []string, library_dirs []string, static_li
 	for path in paths {
 		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
 		match classify(bytes, path)! {
-			.object {
-				part := object.read(bytes, machine) or { return error('${path}: ${err.msg()}') }
+			.object, .coff_object {
+				part := read_object(bytes, machine) or { return error('${path}: ${err.msg()}') }
 				note(mut provided, mut needed, part)
 				out.units << part
 			}
@@ -181,8 +189,8 @@ fn read_group(group Group, dirs []string, static_link bool, machine target.Targe
 	for path in group.paths {
 		bytes := os.read_bytes(path) or { return error('${path}: ${err.msg()}') }
 		match classify(bytes, path)! {
-			.object {
-				part := object.read(bytes, machine) or { return error('${path}: ${err.msg()}') }
+			.object, .coff_object {
+				part := read_object(bytes, machine) or { return error('${path}: ${err.msg()}') }
 				note(mut provided, mut needed, part)
 				out.units << part
 			}
@@ -229,6 +237,16 @@ fn read_group(group Group, dirs []string, static_link bool, machine target.Targe
 			}
 		}
 	}
+}
+
+// read_object reads one relocatable object, whichever container wrote it. The
+// bytes decide: an ELF object begins with the ELF magic and a COFF object begins
+// with its machine number, so the two cannot be mistaken for each other.
+fn read_object(bytes []u8, machine target.Target) !unit.Program {
+	if coff.is_object(bytes) {
+		return coff.read_unit(bytes, machine)
+	}
+	return object.read(bytes, machine)
 }
 
 // note_unit records what a unit defines and what it needs, which is what decides
@@ -298,7 +316,7 @@ fn pull_members(parts archive.Archive, path string, machine target.Target, mut p
 		}
 		pulled[index] = true
 		member := parts.members[index]
-		part := object.read(member.bytes, machine) or {
+		part := read_object(member.bytes, machine) or {
 			return error('${path}: ${member.name}: ${err.msg()}')
 		}
 		note(mut provided, mut needed, part)

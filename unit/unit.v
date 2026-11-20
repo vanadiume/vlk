@@ -174,6 +174,12 @@ pub enum RelocationKind {
 	// and resource table carry. It is the same number `absolute` would write
 	// with the base left out, so a field of it never needs a base relocation.
 	rva
+	// tls_offset writes where a thread-local lies inside one thread's copy of
+	// the block, which is what a Windows image reads: the code reaches its copy
+	// through the thread's own array and adds this number to it. It is not a
+	// distance from a section or a thread pointer, so no base or block base is
+	// part of it.
+	tls_offset
 }
 
 // Import is one name an image needs from a library, with the library the object
@@ -224,6 +230,10 @@ pub mut:
 	data      []u8
 	alignment int
 	kind      SectionKind
+	// comdat is the COMDAT group the section belongs to, or empty. A link
+	// selects one copy of a group and discards the rest, so a link that cannot
+	// select yet has to see the name to say which group it is refusing.
+	comdat string
 }
 
 // Export is one name an image offers to another image. A PE image keeps an
